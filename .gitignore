@@ -1,4 +1,3 @@
-.vscode
 
 # Pylance
 pyrightconfig.json
@@ -46,3 +45,5 @@ checkpoints/
 
 # Ignore generated sample .wav files
 **/*.wav
+config.bat
+node_modules
