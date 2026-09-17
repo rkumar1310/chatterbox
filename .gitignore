@@ -1,4 +1,3 @@
-.vscode
 
 # Pylance
 pyrightconfig.json
@@ -22,6 +21,7 @@ eggs/
 lib/
 lib64/
 parts/
+temp_auto_push.bat
 sdist/
 var/
 wheels/
@@ -46,3 +46,5 @@ checkpoints/
 
 # Ignore generated sample .wav files
 **/*.wav
+.gitignore
+branch_structure.json

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 import torch
@@ -9,13 +10,22 @@ from .const import S3GEN_SR, S3GEN_SIL
 from .s3gen import S3Token2Wav
 
 
+@dataclass
+class _DecodeWindow:
+    speech_tokens: torch.Tensor
+    noise: torch.Tensor
+    context_samples: int
+    stable_end_token: int
+
+
 class S3GenStreamer:
     """Incrementally decode S3 speech tokens into waveform chunks.
 
     S3Gen uses a small lookahead window when converting speech tokens to mels.
-    The streamer buffers that lookahead, reuses stable diffusion noise across
-    repeated prefix decodes, and keeps HiFT source cache/crossfade state to
-    reduce discontinuities at chunk boundaries.
+    The streamer retains a bounded left-context window, reuses stable diffusion
+    noise for overlapping windows, and crossfades adjacent waveform chunks.
+    Setting ``left_context_tokens`` to zero restores full-prefix decoding for
+    quality comparisons and regression benchmarks.
     """
 
     def __init__(
@@ -25,11 +35,13 @@ class S3GenStreamer:
         *,
         n_cfm_timesteps: Optional[int] = None,
         crossfade_ms: float = 12.0,
+        left_context_tokens: int = 25,
     ):
         self.s3gen = s3gen
         self.ref_dict = ref_dict
         self.n_cfm_timesteps = n_cfm_timesteps or (2 if s3gen.meanflow else 10)
         self.crossfade_samples = max(0, int(S3GEN_SR * crossfade_ms / 1000.0))
+        self.left_context_tokens = max(0, int(left_context_tokens))
 
         self.token_buffer: list[torch.Tensor] = []
         self.noised_mels: torch.Tensor | None = None
@@ -38,6 +50,7 @@ class S3GenStreamer:
         )
         self.pending_tail: torch.Tensor | None = None
         self.emitted_samples = 0
+        self.decoded_tokens = 0
         self.generated_tokens = 0
         self.decoded_chunks = 0
         self.finished = False
@@ -87,6 +100,88 @@ class S3GenStreamer:
         return self.noised_mels[:, :, :mel_frames]
 
     def _decode_available(self, *, finalize: bool) -> torch.Tensor | None:
+        if self.left_context_tokens > 0:
+            return self._decode_incremental(finalize=finalize)
+        return self._decode_full_prefix(finalize=finalize)
+
+    def _prepare_incremental_window(
+        self,
+        *,
+        finalize: bool,
+    ) -> _DecodeWindow | None:
+        if not self.token_buffer:
+            return None
+
+        speech_tokens = torch.cat(self.token_buffer, dim=1)
+        stable_end_token = speech_tokens.shape[-1]
+        if not finalize:
+            lookahead = self.s3gen.flow.pre_lookahead_len
+            if stable_end_token <= lookahead:
+                return None
+            stable_end_token -= lookahead
+
+        if stable_end_token <= self.decoded_tokens:
+            return None
+
+        context_start_token = max(
+            0,
+            self.decoded_tokens - self.left_context_tokens,
+        )
+        token_mel_ratio = self.s3gen.flow.token_mel_ratio
+        noise = self._ensure_noise(stable_end_token * token_mel_ratio)
+        noise = noise[
+            :,
+            :,
+            context_start_token * token_mel_ratio : stable_end_token
+            * token_mel_ratio,
+        ]
+        samples_per_token = S3GEN_SR // self.s3gen.flow.input_frame_rate
+        context_samples = (
+            self.decoded_tokens - context_start_token
+        ) * samples_per_token
+        return _DecodeWindow(
+            speech_tokens=speech_tokens[:, context_start_token:],
+            noise=noise,
+            context_samples=context_samples,
+            stable_end_token=stable_end_token,
+        )
+
+    def _decode_incremental(self, *, finalize: bool) -> torch.Tensor | None:
+        window = self._prepare_incremental_window(finalize=finalize)
+        if window is None:
+            return None
+
+        output_mels = self.s3gen(
+            speech_tokens=window.speech_tokens,
+            ref_wav=None,
+            ref_sr=None,
+            ref_dict=self.ref_dict,
+            n_cfm_timesteps=self.n_cfm_timesteps,
+            finalize=finalize,
+            skip_vocoder=True,
+            noised_mels=window.noise,
+        ).to(dtype=self.s3gen.dtype)
+
+        empty_source = torch.zeros(
+            1,
+            1,
+            0,
+            dtype=self.s3gen.dtype,
+            device=self.s3gen.device,
+        )
+        wav, _ = self.s3gen.hift_inference(output_mels, empty_source)
+        wav[:, : len(self.s3gen.trim_fade)] *= self.s3gen.trim_fade
+
+        overlap = self.crossfade_samples if window.context_samples > 0 else 0
+        trim_samples = max(0, window.context_samples - overlap)
+        if trim_samples >= wav.shape[-1]:
+            return None
+
+        self.decoded_tokens = window.stable_end_token
+        self.decoded_chunks += 1
+        return wav[:, trim_samples:]
+
+    def _decode_full_prefix(self, *, finalize: bool) -> torch.Tensor | None:
         if not self.token_buffer:
             return None
 
@@ -203,18 +298,39 @@ class S3GenBatchStreamer:
         *,
         finalize: bool = False,
     ) -> list[tuple[int, torch.Tensor]]:
-        groups: dict[tuple[int, int, int, int], list[int]] = defaultdict(list)
+        full_prefix_groups: dict[tuple[int, int, int, int], list[int]] = defaultdict(
+            list,
+        )
+        incremental_groups: dict[
+            tuple[int, int, int, int, int],
+            list[tuple[int, _DecodeWindow]],
+        ] = defaultdict(list)
         for index in indices:
             streamer = self.streamers[index]
             if not streamer.token_buffer:
                 continue
+            if streamer.left_context_tokens > 0:
+                window = streamer._prepare_incremental_window(finalize=finalize)
+                if window is None:
+                    continue
+                incremental_groups[
+                    (
+                        id(streamer.ref_dict),
+                        window.speech_tokens.shape[-1],
+                        window.noise.shape[-1],
+                        window.context_samples,
+                        streamer.n_cfm_timesteps,
+                    )
+                ].append((index, window))
+                continue
+
             token_count = sum(token.shape[-1] for token in streamer.token_buffer)
             effective_tokens = token_count
             if not finalize:
                 effective_tokens -= self.s3gen.flow.pre_lookahead_len
             if effective_tokens <= 0:
                 continue
-            groups[
+            full_prefix_groups[
                 (
                     id(streamer.ref_dict),
                     token_count,
@@ -224,8 +340,10 @@ class S3GenBatchStreamer:
             ].append(index)
 
         outputs: list[tuple[int, torch.Tensor]] = []
-        for group in groups.values():
-            outputs.extend(self._decode_group(group, finalize=finalize))
+        for group in full_prefix_groups.values():
+            outputs.extend(self._decode_full_prefix_group(group, finalize=finalize))
+        for group in incremental_groups.values():
+            outputs.extend(self._decode_incremental_group(group, finalize=finalize))
         return outputs
 
     def finish(self, indices: Iterable[int]) -> list[tuple[int, torch.Tensor]]:
@@ -244,7 +362,7 @@ class S3GenBatchStreamer:
             pending.append(index)
         return self.flush(pending, finalize=True)
 
-    def _decode_group(
+    def _decode_full_prefix_group(
         self,
         indices: list[int],
         *,
@@ -297,6 +415,68 @@ class S3GenBatchStreamer:
                 streamer.decoded_chunks += 1
                 chunk = wav[:, streamer.emitted_samples :]
             emitted = streamer._emit_smoothed(chunk, finalize=finalize)
+            if emitted is not None:
+                outputs.append((index, emitted))
+        return outputs
+
+    def _decode_incremental_group(
+        self,
+        items: list[tuple[int, _DecodeWindow]],
+        *,
+        finalize: bool,
+    ) -> list[tuple[int, torch.Tensor]]:
+        indices = [index for index, _ in items]
+        windows = [window for _, window in items]
+        streamers = [self.streamers[index] for index in indices]
+        speech_tokens = torch.cat(
+            [window.speech_tokens for window in windows],
+            dim=0,
+        )
+        speech_token_lens = torch.full(
+            (len(streamers),),
+            speech_tokens.shape[-1],
+            dtype=torch.long,
+            device=self.s3gen.device,
+        )
+        noises = torch.cat([window.noise for window in windows], dim=0)
+        output_mels = self.s3gen(
+            speech_tokens=speech_tokens,
+            speech_token_lens=speech_token_lens,
+            ref_wav=None,
+            ref_sr=None,
+            ref_dict=streamers[0].ref_dict,
+            n_cfm_timesteps=streamers[0].n_cfm_timesteps,
+            finalize=finalize,
+            skip_vocoder=True,
+            noised_mels=noises,
+        ).to(dtype=self.s3gen.dtype)
+        empty_source = torch.zeros(
+            len(streamers),
+            1,
+            0,
+            dtype=self.s3gen.dtype,
+            device=self.s3gen.device,
+        )
+        wavs, _ = self.s3gen.hift_inference(output_mels, empty_source)
+        wavs[:, : len(self.s3gen.trim_fade)] *= self.s3gen.trim_fade
+
+        outputs: list[tuple[int, torch.Tensor]] = []
+        for row, (index, streamer, window) in enumerate(
+            zip(indices, streamers, windows),
+        ):
+            overlap = (
+                streamer.crossfade_samples if window.context_samples > 0 else 0
+            )
+            trim_samples = max(0, window.context_samples - overlap)
+            wav = wavs[row : row + 1]
+            if trim_samples >= wav.shape[-1]:
+                continue
+            streamer.decoded_tokens = window.stable_end_token
+            streamer.decoded_chunks += 1
+            emitted = streamer._emit_smoothed(
+                wav[:, trim_samples:],
+                finalize=finalize,
+            )
             if emitted is not None:
                 outputs.append((index, emitted))
         return outputs
