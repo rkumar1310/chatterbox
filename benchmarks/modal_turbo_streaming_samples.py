@@ -77,7 +77,10 @@ def _wav_bytes(audio: Any, sample_rate: int) -> bytes:
     timeout=20 * 60,
     startup_timeout=20 * 60,
 )
-def generate_samples() -> dict[str, Any]:
+def generate_samples(
+    decoder_left_context_tokens: int,
+    batch_concurrency: int,
+) -> dict[str, Any]:
     import numpy as np
     import torch
 
@@ -89,7 +92,12 @@ def generate_samples() -> dict[str, Any]:
     started_at = time.monotonic()
     single_chunks = []
     single_first_audio = None
-    for chunk in model.stream(TEXTS[0], chunk_tokens=24, max_gen_len=600):
+    for chunk in model.stream(
+        TEXTS[0],
+        chunk_tokens=12,
+        max_gen_len=600,
+        decoder_left_context_tokens=decoder_left_context_tokens,
+    ):
         if single_first_audio is None:
             single_first_audio = time.monotonic() - started_at
         single_chunks.append(chunk)
@@ -99,18 +107,22 @@ def generate_samples() -> dict[str, Any]:
     )
 
     torch.manual_seed(20260917)
-    batch_audio: list[list[Any]] = [[] for _ in range(9)]
-    batch_first_audio: list[float | None] = [None] * 9
+    batch_audio: list[list[Any]] = [[] for _ in range(batch_concurrency)]
+    batch_first_audio: list[float | None] = [None] * batch_concurrency
     batch_started_at = time.monotonic()
-    texts = [TEXTS[index % len(TEXTS)] for index in range(9)]
-    for request_index, chunk in model.stream_batch(
-        texts,
-        chunk_tokens=24,
-        max_gen_len=600,
-    ):
-        if batch_first_audio[request_index] is None:
-            batch_first_audio[request_index] = time.monotonic() - batch_started_at
-        batch_audio[request_index].append(chunk.audio.numpy().reshape(-1))
+    texts = [TEXTS[index % len(TEXTS)] for index in range(batch_concurrency)]
+    if texts:
+        for request_index, chunk in model.stream_batch(
+            texts,
+            chunk_tokens=12,
+            max_gen_len=600,
+            decoder_left_context_tokens=decoder_left_context_tokens,
+        ):
+            if batch_first_audio[request_index] is None:
+                batch_first_audio[request_index] = (
+                    time.monotonic() - batch_started_at
+                )
+            batch_audio[request_index].append(chunk.audio.numpy().reshape(-1))
     batch_elapsed = time.monotonic() - batch_started_at
 
     selected = [0, 2, 7]
@@ -121,7 +133,8 @@ def generate_samples() -> dict[str, Any]:
         "model": "ResembleAI/chatterbox-turbo",
         "gpu": torch.cuda.get_device_name(0),
         "sampleRate": model.sr,
-        "chunkTokens": 24,
+        "chunkTokens": 12,
+        "decoderLeftContextTokens": decoder_left_context_tokens,
         "single": {
             "filename": "single-stream.wav",
             "text": TEXTS[0],
@@ -130,13 +143,13 @@ def generate_samples() -> dict[str, Any]:
             "audioSeconds": round(len(single_audio) / model.sr, 4),
         },
         "batch": {
-            "concurrency": 9,
+            "concurrency": batch_concurrency,
             "wallSeconds": round(batch_elapsed, 4),
             "samples": [],
         },
         "note": "Streaming output is not watermarked; generate() is required for Perth watermarking.",
     }
-    for request_index in selected:
+    for request_index in (index for index in selected if index < batch_concurrency):
         audio = np.concatenate(batch_audio[request_index])
         filename = f"batch-9-stream-{request_index + 1}.wav"
         files[filename] = _wav_bytes(audio, model.sr)
@@ -154,8 +167,15 @@ def generate_samples() -> dict[str, Any]:
 
 
 @app.local_entrypoint()
-def main(output_dir: str = "chatterbox-a10-audio-samples") -> None:
-    result = generate_samples.remote()
+def main(
+    output_dir: str = "chatterbox-a10-audio-samples",
+    decoder_left_context_tokens: int = 25,
+    batch_concurrency: int = 0,
+) -> None:
+    result = generate_samples.remote(
+        decoder_left_context_tokens,
+        batch_concurrency,
+    )
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     for filename, contents in result["files"].items():

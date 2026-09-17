@@ -368,6 +368,7 @@ class ChatterboxTurboTTS:
         chunk_tokens=24,
         max_gen_len=1000,
         crossfade_ms=12.0,
+        decoder_left_context_tokens=25,
     ) -> Iterator[StreamingAudioChunk]:
         """Stream Turbo speech as unwatermarked audio chunks.
 
@@ -405,6 +406,7 @@ class ChatterboxTurboTTS:
             self.conds.gen,
             n_cfm_timesteps=2,
             crossfade_ms=crossfade_ms,
+            left_context_tokens=decoder_left_context_tokens,
         )
 
         chunk_index = 0
@@ -469,6 +471,7 @@ class ChatterboxTurboTTS:
         chunk_tokens=24,
         max_gen_len=1000,
         crossfade_ms=12.0,
+        decoder_left_context_tokens=25,
     ) -> Iterator[tuple[int, StreamingAudioChunk]]:
         """Stream a static microbatch of independent Turbo requests.
 
@@ -516,6 +519,7 @@ class ChatterboxTurboTTS:
                 self.conds.gen,
                 n_cfm_timesteps=2,
                 crossfade_ms=crossfade_ms,
+                left_context_tokens=decoder_left_context_tokens,
             )
             for _ in texts
         ]
@@ -642,8 +646,11 @@ class ChatterboxTurboTTS:
         chunk_tokens=24,
         max_gen_len=1000,
         crossfade_ms=12.0,
+        decoder_left_context_tokens=25,
         min_update_chars=16,
         max_update_latency_seconds=0.12,
+        use_cuda_graph=True,
+        on_timing=None,
     ) -> Iterator[tuple[int, StreamingAudioChunk]]:
         """Stream a batch while each request's text is still arriving.
 
@@ -743,6 +750,7 @@ class ChatterboxTurboTTS:
                 self.conds.gen,
                 n_cfm_timesteps=2,
                 crossfade_ms=crossfade_ms,
+                left_context_tokens=decoder_left_context_tokens,
             )
             for _ in text_sources
         ]
@@ -750,6 +758,12 @@ class ChatterboxTurboTTS:
         chunk_indices = [0] * len(text_sources)
         next_samples = [0] * len(text_sources)
         completed = [False] * len(text_sources)
+        first_token_reported = [False] * len(text_sources)
+        started_at = time.perf_counter()
+
+        def report_timing(stage: str, request_index: int) -> None:
+            if on_timing is not None:
+                on_timing(stage, request_index, time.perf_counter() - started_at)
 
         def make_chunk(
             request_index: int,
@@ -774,6 +788,8 @@ class ChatterboxTurboTTS:
             )
             chunk_indices[request_index] += 1
             next_samples[request_index] = end_sample
+            if chunk.index == 0:
+                report_timing("first_pcm", request_index)
             return chunk
 
         with torch.inference_mode():
@@ -785,6 +801,8 @@ class ChatterboxTurboTTS:
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
                 max_gen_len=max_gen_len,
+                use_cuda_graph=use_cuda_graph,
+                cuda_graph_capture_after_tokens=chunk_tokens,
             ):
                 flush_indices = []
                 finish_indices = []
@@ -800,6 +818,9 @@ class ChatterboxTurboTTS:
                     step_state,
                 ):
                     if is_valid:
+                        if not first_token_reported[request_index]:
+                            first_token_reported[request_index] = True
+                            report_timing("first_speech_token", request_index)
                         token = tokens[request_index : request_index + 1, None]
                         if token_value < SPEECH_VOCAB_SIZE:
                             streamers[request_index].append(token)

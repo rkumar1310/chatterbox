@@ -8,7 +8,7 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
-from transformers import LlamaModel, LlamaConfig, GPT2Config, GPT2Model
+from transformers import LlamaModel, LlamaConfig, GPT2Config, GPT2Model, StaticCache
 from transformers.generation.logits_process import (
     LogitsProcessorList,
     RepetitionPenaltyLogitsProcessor,
@@ -659,6 +659,8 @@ class T3(nn.Module):
         repetition_penalty=1.2,
         max_gen_len=1000,
         idle_sleep_seconds=0.005,
+        use_cuda_graph=True,
+        cuda_graph_capture_after_tokens=12,
     ) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
         """Generate speech while the conditioning text is still growing.
 
@@ -704,6 +706,191 @@ class T3(nn.Module):
         outputs = None
         last_positions = None
         rebuilt = False
+        cuda_graph = None
+        cuda_graph_pending = False
+        static_attention_mask = None
+        static_cache_position = None
+        static_position_ids = None
+        static_embed = None
+        static_hidden_states = None
+        graph_physical_position = 0
+
+        def clear_cuda_graph() -> None:
+            nonlocal cuda_graph, cuda_graph_pending
+            nonlocal static_attention_mask, static_cache_position
+            nonlocal static_position_ids, static_embed, static_hidden_states
+            nonlocal graph_physical_position
+            cuda_graph = None
+            cuda_graph_pending = False
+            static_attention_mask = None
+            static_cache_position = None
+            static_position_ids = None
+            static_embed = None
+            static_hidden_states = None
+            graph_physical_position = 0
+
+        def prepare_cuda_graph_prefix():
+            """Rebuild the completed prompt into a static cache after startup."""
+
+            nonlocal past_key_values, cuda_graph_pending
+            nonlocal static_attention_mask, static_cache_position
+            nonlocal static_position_ids, static_embed
+            nonlocal graph_physical_position, last_positions
+
+            max_speech_length = max(len(history) for history in histories)
+            speech_tokens = torch.full(
+                (batch_size, max_speech_length),
+                start_token,
+                dtype=torch.long,
+                device=self.device,
+            )
+            speech_attention_mask = torch.zeros_like(speech_tokens)
+            speech_lengths = []
+            for index, history in enumerate(histories):
+                length = len(history)
+                speech_lengths.append(length)
+                speech_tokens[index, :length] = torch.as_tensor(
+                    history,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                speech_attention_mask[index, :length] = 1
+
+            embeds, len_cond = self.prepare_input_embeds(
+                t3_cond=t3_cond,
+                text_tokens=text_tokens,
+                speech_tokens=speech_tokens,
+                cfg_weight=0.0,
+            )
+            prefix_attention_mask = torch.cat(
+                [
+                    torch.ones(
+                        batch_size,
+                        len_cond,
+                        dtype=torch.long,
+                        device=self.device,
+                    ),
+                    text_attention_mask,
+                    speech_attention_mask,
+                ],
+                dim=1,
+            )
+            prefix_position_ids = prefix_attention_mask.cumsum(-1) - 1
+            prefix_position_ids.masked_fill_(prefix_attention_mask == 0, 0)
+
+            max_cache_len = embeds.shape[1] + max_gen_len + 1
+            past_key_values = StaticCache(
+                config=self.cfg,
+                max_cache_len=max_cache_len,
+            )
+            prefill_cache_position = torch.arange(
+                embeds.shape[1],
+                dtype=torch.long,
+                device=self.device,
+            )
+            prefix_outputs = self.tfmr(
+                inputs_embeds=embeds,
+                attention_mask=prefix_attention_mask,
+                position_ids=prefix_position_ids,
+                past_key_values=past_key_values,
+                cache_position=prefill_cache_position,
+                use_cache=True,
+            )
+            static_attention_mask = torch.zeros(
+                batch_size,
+                max_cache_len,
+                dtype=prefix_attention_mask.dtype,
+                device=self.device,
+            )
+            static_attention_mask[:, : prefix_attention_mask.shape[1]].copy_(
+                prefix_attention_mask,
+            )
+            static_cache_position = torch.tensor(
+                [embeds.shape[1]],
+                dtype=torch.long,
+                device=self.device,
+            )
+            static_position_ids = prefix_attention_mask.sum(
+                dim=-1,
+                keepdim=True,
+            )
+            static_embed = torch.empty(
+                batch_size,
+                1,
+                self.cfg.hidden_size,
+                dtype=embeds.dtype,
+                device=self.device,
+            )
+            graph_physical_position = embeds.shape[1]
+            last_positions = torch.tensor(
+                [
+                    len_cond + text_tokens.shape[1] + length - 1
+                    for length in speech_lengths
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
+            cuda_graph_pending = True
+            return prefix_outputs, prefix_attention_mask
+
+        def run_cuda_graph_step(
+            next_tokens: Tensor,
+            continuing: Tensor,
+        ) -> tuple[Tensor]:
+            """Consume one sampled token through a fixed-shape CUDA graph."""
+
+            nonlocal cuda_graph, cuda_graph_pending, static_hidden_states
+            nonlocal graph_physical_position
+
+            static_embed.copy_(self.speech_emb(next_tokens[:, None]))
+            static_attention_mask[:, graph_physical_position].copy_(
+                continuing.to(dtype=static_attention_mask.dtype),
+            )
+
+            if cuda_graph_pending:
+                # CUDA graph capture requires eager warm-up on a side stream.
+                # Keep it after the first yielded token so capture cannot inflate
+                # time-to-first-speech-token.
+                warmup_cache = StaticCache(
+                    config=self.cfg,
+                    max_cache_len=static_attention_mask.shape[1],
+                )
+                warmup_stream = torch.cuda.Stream()
+                warmup_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(warmup_stream):
+                    for _ in range(3):
+                        self.tfmr(
+                            inputs_embeds=static_embed,
+                            attention_mask=static_attention_mask,
+                            position_ids=static_position_ids,
+                            past_key_values=warmup_cache,
+                            cache_position=static_cache_position,
+                            use_cache=True,
+                        )
+                torch.cuda.current_stream().wait_stream(warmup_stream)
+                del warmup_cache, warmup_stream
+
+                cuda_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cuda_graph):
+                    captured_outputs = self.tfmr(
+                        inputs_embeds=static_embed,
+                        attention_mask=static_attention_mask,
+                        position_ids=static_position_ids,
+                        past_key_values=past_key_values,
+                        cache_position=static_cache_position,
+                        use_cache=True,
+                    )
+                static_hidden_states = captured_outputs[0]
+                cuda_graph_pending = False
+                hidden_states = static_hidden_states
+            else:
+                cuda_graph.replay()
+                hidden_states = static_hidden_states
+
+            static_cache_position.add_(1)
+            static_position_ids.add_(continuing[:, None])
+            graph_physical_position += 1
+            return (hidden_states,)
 
         while True:
             supplied = text_supplier(waiting)
@@ -738,6 +925,7 @@ class T3(nn.Module):
                     finished[index] = True
 
             if needs_rebuild:
+                clear_cuda_graph()
                 max_speech_length = max(len(history) for history in histories)
                 speech_tokens = torch.full(
                     (batch_size, max_speech_length),
@@ -813,20 +1001,16 @@ class T3(nn.Module):
                 hidden = outputs[0][:, -1, :]
             speech_logits = self.speech_head(hidden)
 
-            next_tokens = torch.full(
-                (batch_size,),
-                stop_token,
-                dtype=torch.long,
-                device=self.device,
-            )
-            valid = torch.zeros(
-                batch_size,
-                dtype=torch.bool,
-                device=self.device,
-            )
-            for index in active_indices:
-                generated_ids = torch.tensor(
-                    histories[index],
+            active_set = set(active_indices)
+            sampled_tokens = []
+            for index, history in enumerate(histories):
+                if index not in active_set:
+                    sampled_tokens.append(
+                        torch.tensor(stop_token, device=self.device),
+                    )
+                    continue
+                generated_ids = torch.as_tensor(
+                    history,
                     dtype=torch.long,
                     device=self.device,
                 ).unsqueeze(0)
@@ -834,25 +1018,33 @@ class T3(nn.Module):
                     generated_ids,
                     speech_logits[index : index + 1],
                 )
-                if torch.all(processed_logits == -float("inf")):
-                    raise RuntimeError(
-                        f"all Turbo logits are -inf for live request {index}",
-                    )
                 probs = F.softmax(processed_logits, dim=-1)
-                token = torch.multinomial(probs, num_samples=1)[0, 0]
-                next_tokens[index] = token
-                if int(token.item()) == stop_token:
+                sampled_tokens.append(
+                    torch.multinomial(probs, num_samples=1)[0, 0],
+                )
+            next_tokens = torch.stack(sampled_tokens)
+            next_token_values = next_tokens.detach().cpu().tolist()
+
+            valid_values = [False] * batch_size
+            for index in active_indices:
+                token_value = next_token_values[index]
+                if token_value == stop_token:
                     if input_done[index]:
                         finished[index] = True
                     else:
                         waiting[index] = True
                     continue
 
-                histories[index].append(int(token.item()))
-                valid[index] = True
+                histories[index].append(token_value)
+                valid_values[index] = True
                 if len(histories[index]) - 1 >= max_gen_len:
                     finished[index] = True
 
+            valid = torch.tensor(
+                valid_values,
+                dtype=torch.bool,
+                device=self.device,
+            )
             finished_tensor = torch.tensor(
                 finished,
                 dtype=torch.bool,
@@ -864,20 +1056,40 @@ class T3(nn.Module):
                 break
 
             continuing = valid & ~finished_tensor
-            query_mask = continuing.to(dtype=torch.long)[:, None]
-            attention_mask = torch.cat([attention_mask, query_mask], dim=1)
-            query_position_ids = attention_mask.cumsum(-1)[:, -1:] - 1
-            query_position_ids.masked_fill_(query_mask == 0, 0)
-            speech_embed = self.speech_emb(next_tokens[:, None])
-            outputs = self.tfmr(
-                inputs_embeds=speech_embed,
-                attention_mask=attention_mask,
-                position_ids=query_position_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
+            generated_token_count = max(len(history) for history in histories) - 1
+            should_prepare_cuda_graph = (
+                use_cuda_graph
+                and self.device.type == "cuda"
+                and batch_size <= 4
+                and all(input_done)
+                and cuda_graph is None
+                and not cuda_graph_pending
+                and generated_token_count >= cuda_graph_capture_after_tokens
             )
-            past_key_values = outputs.past_key_values
-            rebuilt = False
+            if should_prepare_cuda_graph:
+                outputs, attention_mask = prepare_cuda_graph_prefix()
+                rebuilt = True
+            elif cuda_graph_pending or cuda_graph is not None:
+                outputs = run_cuda_graph_step(
+                    next_tokens,
+                    continuing,
+                )
+                rebuilt = False
+            else:
+                query_mask = continuing.to(dtype=torch.long)[:, None]
+                attention_mask = torch.cat([attention_mask, query_mask], dim=1)
+                query_position_ids = attention_mask.cumsum(-1)[:, -1:] - 1
+                query_position_ids.masked_fill_(query_mask == 0, 0)
+                speech_embed = self.speech_emb(next_tokens[:, None])
+                outputs = self.tfmr(
+                    inputs_embeds=speech_embed,
+                    attention_mask=attention_mask,
+                    position_ids=query_position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                past_key_values = outputs.past_key_values
+                rebuilt = False
 
     @torch.inference_mode()
     def inference_turbo(
