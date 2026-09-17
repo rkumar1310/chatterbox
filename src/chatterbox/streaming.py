@@ -3,6 +3,7 @@ from __future__ import annotations
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Iterable, Iterator
 
 import numpy as np
@@ -32,6 +33,63 @@ class StreamingAudioChunk:
         return (self.end_sample - self.start_sample) / self.sample_rate
 
 
+@dataclass(frozen=True)
+class LiveTextSnapshot:
+    """One atomic view of text supplied to a live TTS request."""
+
+    text: str
+    version: int
+    input_done: bool
+    cancelled: bool
+
+
+class LiveTextStream:
+    """Thread-safe append-only text source for live Turbo generation."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._text = ""
+        self._version = 0
+        self._input_done = False
+        self._cancelled = False
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            if self._input_done:
+                raise RuntimeError("text input is already complete")
+            if self._cancelled:
+                raise RuntimeError("text input is cancelled")
+            self._text += text
+            self._version += 1
+
+    def finish(self) -> None:
+        with self._lock:
+            if self._input_done:
+                raise RuntimeError("text input is already complete")
+            if self._cancelled:
+                raise RuntimeError("text input is cancelled")
+            self._input_done = True
+            self._version += 1
+
+    def cancel(self) -> None:
+        with self._lock:
+            if self._cancelled:
+                return
+            self._cancelled = True
+            self._version += 1
+
+    def snapshot(self) -> LiveTextSnapshot:
+        with self._lock:
+            return LiveTextSnapshot(
+                text=self._text,
+                version=self._version,
+                input_done=self._input_done,
+                cancelled=self._cancelled,
+            )
+
+
 def audio_to_pcm_s16le(audio: torch.Tensor) -> bytes:
     """Convert a mono float audio tensor to raw little-endian signed 16-bit PCM."""
     audio_np = audio.detach().cpu().reshape(-1).numpy()
@@ -45,7 +103,9 @@ def chunks_to_pcm_s16le(chunks: Iterable[StreamingAudioChunk]) -> Iterator[bytes
         yield audio_to_pcm_s16le(chunk.audio)
 
 
-def write_chunks_to_wav(path: str | Path, chunks: Iterable[StreamingAudioChunk]) -> Path:
+def write_chunks_to_wav(
+    path: str | Path, chunks: Iterable[StreamingAudioChunk]
+) -> Path:
     """Write streamed chunks to a mono 16-bit PCM WAV file."""
     path = Path(path)
     iterator = iter(chunks)

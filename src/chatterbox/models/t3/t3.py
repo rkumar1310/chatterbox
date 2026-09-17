@@ -1,9 +1,8 @@
 # Copyright (c) 2025 Resemble AI
 # MIT License
 import logging
-from typing import Iterator, Union, Optional, List
-
-logger = logging.getLogger(__name__)
+import time
+from typing import Callable, Iterator, Optional, Sequence
 
 from tqdm import tqdm
 import torch
@@ -645,6 +644,240 @@ class T3(nn.Module):
                 use_cache=True,
             )
             past_key_values = outputs.past_key_values
+
+    @torch.inference_mode()
+    def iter_inference_turbo_live_batch(
+        self,
+        t3_cond,
+        text_supplier: Callable[
+            [Sequence[bool]],
+            tuple[Tensor, Tensor, Sequence[int], Sequence[bool], Sequence[bool]],
+        ],
+        temperature=0.8,
+        top_k=1000,
+        top_p=0.95,
+        repetition_penalty=1.2,
+        max_gen_len=1000,
+        idle_sleep_seconds=0.005,
+    ) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
+        """Generate speech while the conditioning text is still growing.
+
+        Turbo is a decoder-only model whose text appears before speech in the
+        prompt. When text grows, the KV cache is rebuilt from the longer text
+        and the speech tokens already generated. This preserves the spoken
+        prefix while allowing the next speech token to see newly arrived text.
+
+        ``text_supplier`` receives the rows currently waiting at EOS and
+        returns padded text tokens, their attention mask, monotonically
+        increasing row versions, input-complete flags, and cancellation flags.
+        """
+
+        logits_processors = LogitsProcessorList()
+        if temperature > 0 and temperature != 1.0:
+            logits_processors.append(TemperatureLogitsWarper(temperature))
+        if top_k > 0:
+            logits_processors.append(TopKLogitsWarper(top_k))
+        if top_p < 1.0:
+            logits_processors.append(TopPLogitsWarper(top_p))
+        if repetition_penalty != 1.0:
+            logits_processors.append(
+                RepetitionPenaltyLogitsProcessor(repetition_penalty),
+            )
+
+        initial = text_supplier([])
+        text_tokens = torch.atleast_2d(initial[0]).to(
+            dtype=torch.long,
+            device=self.device,
+        )
+        batch_size = text_tokens.shape[0]
+        if batch_size < 1:
+            raise ValueError("live text batch must contain at least one request")
+
+        start_token = self.hp.start_speech_token
+        stop_token = self.hp.stop_speech_token
+        histories: list[list[int]] = [[start_token] for _ in range(batch_size)]
+        current_versions = [-1] * batch_size
+        waiting = [False] * batch_size
+        finished = [False] * batch_size
+        attention_mask = None
+        past_key_values = None
+        outputs = None
+        last_positions = None
+        rebuilt = False
+
+        while True:
+            supplied = text_supplier(waiting)
+            text_tokens = torch.atleast_2d(supplied[0]).to(
+                dtype=torch.long,
+                device=self.device,
+            )
+            text_attention_mask = torch.atleast_2d(supplied[1]).to(
+                dtype=torch.long,
+                device=self.device,
+            )
+            versions = list(supplied[2])
+            input_done = list(supplied[3])
+            cancelled = list(supplied[4])
+            if text_tokens.shape != text_attention_mask.shape:
+                raise ValueError("live text attention mask must match text tokens")
+            if text_tokens.shape[0] != batch_size:
+                raise ValueError("live text batch size cannot change")
+            if not (len(versions) == len(input_done) == len(cancelled) == batch_size):
+                raise ValueError("live text metadata must match batch size")
+
+            changed = [
+                version != current_versions[index]
+                for index, version in enumerate(versions)
+            ]
+            needs_rebuild = outputs is None or any(changed)
+            for index, did_change in enumerate(changed):
+                if did_change:
+                    waiting[index] = False
+                    current_versions[index] = versions[index]
+                if cancelled[index]:
+                    finished[index] = True
+
+            if needs_rebuild:
+                max_speech_length = max(len(history) for history in histories)
+                speech_tokens = torch.full(
+                    (batch_size, max_speech_length),
+                    start_token,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                speech_attention_mask = torch.zeros_like(speech_tokens)
+                speech_lengths = []
+                for index, history in enumerate(histories):
+                    length = len(history)
+                    speech_lengths.append(length)
+                    speech_tokens[index, :length] = torch.tensor(
+                        history,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    speech_attention_mask[index, :length] = 1
+
+                embeds, len_cond = self.prepare_input_embeds(
+                    t3_cond=t3_cond,
+                    text_tokens=text_tokens,
+                    speech_tokens=speech_tokens,
+                    cfg_weight=0.0,
+                )
+                attention_mask = torch.cat(
+                    [
+                        torch.ones(
+                            batch_size,
+                            len_cond,
+                            dtype=torch.long,
+                            device=self.device,
+                        ),
+                        text_attention_mask,
+                        speech_attention_mask,
+                    ],
+                    dim=1,
+                )
+                position_ids = attention_mask.cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 0)
+                outputs = self.tfmr(
+                    inputs_embeds=embeds,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=True,
+                )
+                past_key_values = outputs.past_key_values
+                last_positions = torch.tensor(
+                    [
+                        len_cond + text_tokens.shape[1] + length - 1
+                        for length in speech_lengths
+                    ],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                rebuilt = True
+
+            active_indices = [
+                index
+                for index in range(batch_size)
+                if not finished[index] and not waiting[index]
+            ]
+            if not active_indices:
+                if all(finished):
+                    break
+                time.sleep(idle_sleep_seconds)
+                continue
+
+            if rebuilt:
+                rows = torch.arange(batch_size, device=self.device)
+                hidden = outputs[0][rows, last_positions]
+            else:
+                hidden = outputs[0][:, -1, :]
+            speech_logits = self.speech_head(hidden)
+
+            next_tokens = torch.full(
+                (batch_size,),
+                stop_token,
+                dtype=torch.long,
+                device=self.device,
+            )
+            valid = torch.zeros(
+                batch_size,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            for index in active_indices:
+                generated_ids = torch.tensor(
+                    histories[index],
+                    dtype=torch.long,
+                    device=self.device,
+                ).unsqueeze(0)
+                processed_logits = logits_processors(
+                    generated_ids,
+                    speech_logits[index : index + 1],
+                )
+                if torch.all(processed_logits == -float("inf")):
+                    raise RuntimeError(
+                        f"all Turbo logits are -inf for live request {index}",
+                    )
+                probs = F.softmax(processed_logits, dim=-1)
+                token = torch.multinomial(probs, num_samples=1)[0, 0]
+                next_tokens[index] = token
+                if int(token.item()) == stop_token:
+                    if input_done[index]:
+                        finished[index] = True
+                    else:
+                        waiting[index] = True
+                    continue
+
+                histories[index].append(int(token.item()))
+                valid[index] = True
+                if len(histories[index]) - 1 >= max_gen_len:
+                    finished[index] = True
+
+            finished_tensor = torch.tensor(
+                finished,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            yield next_tokens, valid, finished_tensor
+
+            if all(finished):
+                break
+
+            continuing = valid & ~finished_tensor
+            query_mask = continuing.to(dtype=torch.long)[:, None]
+            attention_mask = torch.cat([attention_mask, query_mask], dim=1)
+            query_position_ids = attention_mask.cumsum(-1)[:, -1:] - 1
+            query_position_ids.masked_fill_(query_mask == 0, 0)
+            speech_embed = self.speech_emb(next_tokens[:, None])
+            outputs = self.tfmr(
+                inputs_embeds=speech_embed,
+                attention_mask=attention_mask,
+                position_ids=query_position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            rebuilt = False
 
     @torch.inference_mode()
     def inference_turbo(

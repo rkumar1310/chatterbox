@@ -1,5 +1,6 @@
 import os
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -30,7 +31,7 @@ REPO_ID = "ResembleAI/chatterbox-turbo"
 NANO_REPO_ID = "ResembleAI/chatterbox-nano"
 
 
-def punc_norm(text: str) -> str:
+def punc_norm(text: str, *, add_terminal_punctuation: bool = True) -> str:
     """
     Quick cleanup func for punctuation from LLMs or
     containing chars not seen often in the dataset
@@ -63,7 +64,7 @@ def punc_norm(text: str) -> str:
     # Add full stop if no ending punc
     text = text.rstrip(" ")
     sentence_enders = {".", "!", "?", "-", ","}
-    if not any(text.endswith(p) for p in sentence_enders):
+    if add_terminal_punctuation and not any(text.endswith(p) for p in sentence_enders):
         text += "."
 
     return text
@@ -624,4 +625,228 @@ class ChatterboxTurboTTS:
                         wav,
                         is_final=True,
                     ),
+                )
+
+    def stream_live_batch(
+        self,
+        text_sources: Sequence,
+        repetition_penalty=1.2,
+        min_p=0.00,
+        top_p=0.95,
+        audio_prompt_path=None,
+        exaggeration=0.0,
+        cfg_weight=0.0,
+        temperature=0.8,
+        top_k=1000,
+        norm_loudness=True,
+        chunk_tokens=24,
+        max_gen_len=1000,
+        crossfade_ms=12.0,
+        min_update_chars=16,
+        max_update_latency_seconds=0.12,
+    ) -> Iterator[tuple[int, StreamingAudioChunk]]:
+        """Stream a batch while each request's text is still arriving.
+
+        Each source must expose ``snapshot()`` returning ``text``, ``version``,
+        ``input_done`` and ``cancelled`` attributes. Text updates are coalesced
+        briefly, then T3 rebuilds its KV cache from the longer text and the
+        speech-token prefix already generated. Audio decoder state is retained
+        until the request finishes, so text updates do not create new vocoder
+        streams or sentence-boundary silence.
+        """
+        text_sources = list(text_sources)
+        if not text_sources:
+            raise ValueError("text_sources must contain at least one request")
+        if chunk_tokens <= 0:
+            raise ValueError("chunk_tokens must be positive")
+        if min_update_chars < 1:
+            raise ValueError("min_update_chars must be positive")
+        if max_update_latency_seconds <= 0:
+            raise ValueError("max_update_latency_seconds must be positive")
+
+        if audio_prompt_path:
+            self.prepare_conditionals(
+                audio_prompt_path,
+                exaggeration=exaggeration,
+                norm_loudness=norm_loudness,
+            )
+        else:
+            assert self.conds is not None, (
+                "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            )
+
+        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
+            logger.warning(
+                "CFG, min_p and exaggeration are not supported by Turbo version "
+                "and will be ignored.",
+            )
+
+        accepted = [source.snapshot() for source in text_sources]
+        if any(not snapshot.text.strip() for snapshot in accepted):
+            raise ValueError("every live text source must contain initial text")
+        pending_since: list[float | None] = [None] * len(text_sources)
+        token_cache = None
+        token_cache_versions: tuple[int, ...] | None = None
+
+        def supply_text(waiting: Sequence[bool]):
+            nonlocal accepted, token_cache, token_cache_versions
+            now = time.monotonic()
+            current = [source.snapshot() for source in text_sources]
+            for index, snapshot in enumerate(current):
+                if snapshot.version == accepted[index].version:
+                    pending_since[index] = None
+                    continue
+                if pending_since[index] is None:
+                    pending_since[index] = now
+                growth = len(snapshot.text) - len(accepted[index].text)
+                should_accept = (
+                    snapshot.input_done
+                    or snapshot.cancelled
+                    or growth >= min_update_chars
+                    or now - pending_since[index] >= max_update_latency_seconds
+                )
+                if should_accept:
+                    accepted[index] = snapshot
+                    pending_since[index] = None
+
+            versions = tuple(snapshot.version for snapshot in accepted)
+            if token_cache is None or versions != token_cache_versions:
+                normalized = [
+                    punc_norm(
+                        snapshot.text,
+                        add_terminal_punctuation=snapshot.input_done,
+                    )
+                    for snapshot in accepted
+                ]
+                tokenized = self.tokenizer(
+                    normalized,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                )
+                token_cache = (
+                    tokenized.input_ids.to(self.device),
+                    tokenized.attention_mask.to(self.device),
+                )
+                token_cache_versions = versions
+            return (
+                token_cache[0],
+                token_cache[1],
+                versions,
+                [snapshot.input_done for snapshot in accepted],
+                [snapshot.cancelled for snapshot in accepted],
+            )
+
+        streamers = [
+            S3GenStreamer(
+                self.s3gen,
+                self.conds.gen,
+                n_cfm_timesteps=2,
+                crossfade_ms=crossfade_ms,
+            )
+            for _ in text_sources
+        ]
+        batch_streamer = S3GenBatchStreamer(streamers)
+        chunk_indices = [0] * len(text_sources)
+        next_samples = [0] * len(text_sources)
+        completed = [False] * len(text_sources)
+
+        def make_chunk(
+            request_index: int,
+            wav: torch.Tensor,
+            *,
+            is_final: bool,
+        ) -> StreamingAudioChunk:
+            audio = wav.detach().to(device="cpu", dtype=torch.float32)
+            if audio.ndim == 1:
+                audio = audio.unsqueeze(0)
+            start_sample = next_samples[request_index]
+            end_sample = start_sample + audio.shape[-1]
+            chunk = StreamingAudioChunk(
+                audio=audio,
+                sample_rate=self.sr,
+                index=chunk_indices[request_index],
+                is_final=is_final,
+                start_sample=start_sample,
+                end_sample=end_sample,
+                generated_tokens=streamers[request_index].generated_tokens,
+                watermarked=False,
+            )
+            chunk_indices[request_index] += 1
+            next_samples[request_index] = end_sample
+            return chunk
+
+        with torch.inference_mode():
+            for tokens, valid, finished in self.t3.iter_inference_turbo_live_batch(
+                t3_cond=self.conds.t3,
+                text_supplier=supply_text,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                max_gen_len=max_gen_len,
+            ):
+                flush_indices = []
+                finish_indices = []
+                step_state = (
+                    torch.stack(
+                        [tokens.long(), valid.long(), finished.long()],
+                        dim=1,
+                    )
+                    .cpu()
+                    .tolist()
+                )
+                for request_index, (token_value, is_valid, is_finished) in enumerate(
+                    step_state,
+                ):
+                    if is_valid:
+                        token = tokens[request_index : request_index + 1, None]
+                        if token_value < SPEECH_VOCAB_SIZE:
+                            streamers[request_index].append(token)
+                            if (
+                                streamers[request_index].generated_tokens % chunk_tokens
+                                == 0
+                            ):
+                                flush_indices.append(request_index)
+                    if is_finished and not completed[request_index]:
+                        finish_indices.append(request_index)
+
+                if finish_indices:
+                    cancelled = {
+                        index
+                        for index in finish_indices
+                        if text_sources[index].snapshot().cancelled
+                    }
+                    decodable = [
+                        index for index in finish_indices if index not in cancelled
+                    ]
+                    finish_set = set(finish_indices)
+                    flush_indices = [
+                        index for index in flush_indices if index not in finish_set
+                    ]
+                    finished_audio = batch_streamer.finish(decodable)
+                    for request_index in finish_indices:
+                        completed[request_index] = True
+                    for request_index, wav in finished_audio:
+                        yield (
+                            request_index,
+                            make_chunk(request_index, wav, is_final=True),
+                        )
+
+                for request_index, wav in batch_streamer.flush(flush_indices):
+                    yield (
+                        request_index,
+                        make_chunk(request_index, wav, is_final=False),
+                    )
+
+            unfinished = [
+                index
+                for index, is_complete in enumerate(completed)
+                if not is_complete and not text_sources[index].snapshot().cancelled
+            ]
+            for request_index, wav in batch_streamer.finish(unfinished):
+                completed[request_index] = True
+                yield (
+                    request_index,
+                    make_chunk(request_index, wav, is_final=True),
                 )

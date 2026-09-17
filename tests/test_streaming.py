@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from chatterbox.streaming import (
+    LiveTextStream,
     StreamingAudioChunk,
     audio_to_pcm_s16le,
     chunks_to_pcm_s16le,
@@ -14,6 +15,32 @@ from chatterbox.streaming import (
 
 
 class StreamingUtilsTest(unittest.TestCase):
+    def test_live_text_stream_is_append_only_and_versioned(self):
+        source = LiveTextStream()
+        source.append("Hello")
+        source.append(" world")
+
+        snapshot = source.snapshot()
+        self.assertEqual(snapshot.text, "Hello world")
+        self.assertEqual(snapshot.version, 2)
+        self.assertFalse(snapshot.input_done)
+        self.assertFalse(snapshot.cancelled)
+
+        source.finish()
+        self.assertTrue(source.snapshot().input_done)
+        with self.assertRaisesRegex(RuntimeError, "already complete"):
+            source.append("!")
+
+    def test_live_text_stream_can_cancel_generation(self):
+        source = LiveTextStream()
+        source.append("Stop this request")
+        source.cancel()
+
+        snapshot = source.snapshot()
+        self.assertTrue(snapshot.cancelled)
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            source.finish()
+
     def test_audio_to_pcm_s16le_clamps_and_converts(self):
         audio = torch.tensor([[0.0, 1.0, -1.0, 2.0, -2.0]], dtype=torch.float32)
 
