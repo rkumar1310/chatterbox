@@ -2,7 +2,7 @@ import os
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 import librosa
 import torch
@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 
 from .models.t3 import T3
 from .models.s3tokenizer import S3_SR, SPEECH_VOCAB_SIZE
-from .models.s3gen import S3GEN_SR, S3Gen, S3GenStreamer
+from .models.s3gen import S3GEN_SR, S3Gen, S3GenBatchStreamer, S3GenStreamer
 from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
@@ -23,6 +23,7 @@ from .models.t3.modules.t3_config import T3Config
 from .models.s3gen.const import S3GEN_SIL
 from .streaming import StreamingAudioChunk
 import logging
+
 logger = logging.getLogger(__name__)
 
 REPO_ID = "ResembleAI/chatterbox-turbo"
@@ -31,8 +32,8 @@ NANO_REPO_ID = "ResembleAI/chatterbox-nano"
 
 def punc_norm(text: str) -> str:
     """
-        Quick cleanup func for punctuation from LLMs or
-        containing chars not seen often in the dataset
+    Quick cleanup func for punctuation from LLMs or
+    containing chars not seen often in the dataset
     """
     if len(text) == 0:
         return "You need to add some text for me to talk."
@@ -51,8 +52,8 @@ def punc_norm(text: str) -> str:
         ("—", "-"),
         ("–", "-"),
         (" ,", ","),
-        ("“", "\""),
-        ("”", "\""),
+        ("“", '"'),
+        ("”", '"'),
         ("‘", "'"),
         ("’", "'"),
     ]
@@ -85,6 +86,7 @@ class Conditionals:
         - prompt_feat_len
         - embedding
     """
+
     t3: T3Cond
     gen: dict
 
@@ -96,10 +98,7 @@ class Conditionals:
         return self
 
     def save(self, fpath: Path):
-        arg_dict = dict(
-            t3=self.t3.__dict__,
-            gen=self.gen
-        )
+        arg_dict = dict(t3=self.t3.__dict__, gen=self.gen)
         torch.save(arg_dict, fpath)
 
     @classmethod
@@ -107,7 +106,7 @@ class Conditionals:
         if isinstance(map_location, str):
             map_location = torch.device(map_location)
         kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
-        return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
+        return cls(T3Cond(**kwargs["t3"]), kwargs["gen"])
 
 
 class ChatterboxTurboTTS:
@@ -135,19 +134,17 @@ class ChatterboxTurboTTS:
         self.watermarker = perth.PerthImplicitWatermarker()
 
     @classmethod
-    def from_local(cls, ckpt_dir, device, nano=False) -> 'ChatterboxTurboTTS':
+    def from_local(cls, ckpt_dir, device, nano=False) -> "ChatterboxTurboTTS":
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
         if device in ["cpu", "mps"]:
-            map_location = torch.device('cpu')
+            map_location = torch.device("cpu")
         else:
             map_location = None
 
         ve = VoiceEncoder()
-        ve.load_state_dict(
-            load_file(ckpt_dir / "ve.safetensors")
-        )
+        ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))
         ve.to(device).eval()
 
         # Turbo/Nano share the same architecture; Nano just uses a smaller
@@ -171,9 +168,7 @@ class ChatterboxTurboTTS:
 
         s3gen = S3Gen(meanflow=True)
         weights = load_file(ckpt_dir / "s3gen_meanflow.safetensors")
-        s3gen.load_state_dict(
-            weights, strict=True
-        )
+        s3gen.load_state_dict(weights, strict=True)
         s3gen.to(device).eval()
 
         tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
@@ -185,19 +180,32 @@ class ChatterboxTurboTTS:
         conds = None
         builtin_voice = ckpt_dir / "conds.pt"
         if builtin_voice.exists():
-            conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
+            conds = Conditionals.load(builtin_voice, map_location=map_location).to(
+                device
+            )
 
-        return cls(t3, s3gen, ve, tokenizer, device, conds=conds,
-                   model_label="Nano" if nano else "Turbo")
+        return cls(
+            t3,
+            s3gen,
+            ve,
+            tokenizer,
+            device,
+            conds=conds,
+            model_label="Nano" if nano else "Turbo",
+        )
 
     @classmethod
-    def from_pretrained(cls, device, nano=False) -> 'ChatterboxTurboTTS':
+    def from_pretrained(cls, device, nano=False) -> "ChatterboxTurboTTS":
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
-                print("MPS not available because the current PyTorch install was not built with MPS enabled.")
+                print(
+                    "MPS not available because the current PyTorch install was not built with MPS enabled."
+                )
             else:
-                print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
+                print(
+                    "MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine."
+                )
             device = "cpu"
 
         download_kwargs = dict(
@@ -214,12 +222,15 @@ class ChatterboxTurboTTS:
             # standard HTTP/LFS download path so end users don't have to set
             # HF_HUB_DISABLE_XET themselves.
             if "xet" in str(e).lower() or "hex hash" in str(e).lower():
-                logger.warning(f"Xet download failed ({e}); retrying with Xet disabled.")
+                logger.warning(
+                    f"Xet download failed ({e}); retrying with Xet disabled."
+                )
                 # NOTE: HF_HUB_DISABLE_XET is only read into this constant at
                 # import time, so setting the env var now would be a no-op.
                 # is_xet_available() reads the constant dynamically, so flip it
                 # directly to force the standard HTTP/LFS download path.
                 import huggingface_hub.constants as hf_constants
+
                 hf_constants.HF_HUB_DISABLE_XET = True
                 local_path = snapshot_download(**download_kwargs)
             else:
@@ -244,24 +255,34 @@ class ChatterboxTurboTTS:
         ## Load and norm reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
-        assert len(s3gen_ref_wav) / _sr > 5.0, "Audio prompt must be longer than 5 seconds!"
+        assert len(s3gen_ref_wav) / _sr > 5.0, (
+            "Audio prompt must be longer than 5 seconds!"
+        )
 
         if norm_loudness:
             s3gen_ref_wav = self.norm_loudness(s3gen_ref_wav, _sr)
 
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
-        s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
-        s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
+        s3gen_ref_wav = s3gen_ref_wav[: self.DEC_COND_LEN]
+        s3gen_ref_dict = self.s3gen.embed_ref(
+            s3gen_ref_wav, S3GEN_SR, device=self.device
+        )
 
         # Speech cond prompt tokens
         if plen := self.t3.hp.speech_cond_prompt_len:
             s3_tokzr = self.s3gen.tokenizer
-            t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
-            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
+            t3_cond_prompt_tokens, _ = s3_tokzr.forward(
+                [ref_16k_wav[: self.ENC_COND_LEN]], max_len=plen
+            )
+            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(
+                self.device
+            )
 
         # Voice-encoder speaker embedding
-        ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
+        ve_embed = torch.from_numpy(
+            self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR)
+        )
         ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
 
         t3_cond = T3Cond(
@@ -285,16 +306,26 @@ class ChatterboxTurboTTS:
         norm_loudness=True,
     ):
         if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+            self.prepare_conditionals(
+                audio_prompt_path,
+                exaggeration=exaggeration,
+                norm_loudness=norm_loudness,
+            )
         else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            assert self.conds is not None, (
+                "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            )
 
         if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
-            logger.warning(f"CFG, min_p and exaggeration are not supported by the {self.model_label} version and will be ignored.")
+            logger.warning(
+                f"CFG, min_p and exaggeration are not supported by the {self.model_label} version and will be ignored."
+            )
 
         # Norm and tokenize text
         text = punc_norm(text)
-        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        text_tokens = self.tokenizer(
+            text, return_tensors="pt", padding=True, truncation=True
+        )
         text_tokens = text_tokens.input_ids.to(self.device)
 
         speech_tokens = self.t3.inference_turbo(
@@ -347,15 +378,25 @@ class ChatterboxTurboTTS:
             raise ValueError("chunk_tokens must be positive")
 
         if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+            self.prepare_conditionals(
+                audio_prompt_path,
+                exaggeration=exaggeration,
+                norm_loudness=norm_loudness,
+            )
         else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            assert self.conds is not None, (
+                "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            )
 
         if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
-            logger.warning("CFG, min_p and exaggeration are not supported by Turbo version and will be ignored.")
+            logger.warning(
+                "CFG, min_p and exaggeration are not supported by Turbo version and will be ignored."
+            )
 
         text = punc_norm(text)
-        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        text_tokens = self.tokenizer(
+            text, return_tensors="pt", padding=True, truncation=True
+        )
         text_tokens = text_tokens.input_ids.to(self.device)
 
         streamer = S3GenStreamer(
@@ -411,3 +452,176 @@ class ChatterboxTurboTTS:
             wav = streamer.finish()
             if wav is not None:
                 yield make_chunk(wav, is_final=True)
+
+    def stream_batch(
+        self,
+        texts: Sequence[str],
+        repetition_penalty=1.2,
+        min_p=0.00,
+        top_p=0.95,
+        audio_prompt_path=None,
+        exaggeration=0.0,
+        cfg_weight=0.0,
+        temperature=0.8,
+        top_k=1000,
+        norm_loudness=True,
+        chunk_tokens=24,
+        max_gen_len=1000,
+        crossfade_ms=12.0,
+    ) -> Iterator[tuple[int, StreamingAudioChunk]]:
+        """Stream a static microbatch of independent Turbo requests.
+
+        Yields ``(request_index, chunk)`` as soon as each audio chunk is
+        decoded. T3 token generation and compatible S3Gen/vocoder work are
+        executed as GPU batches while per-request caches, noise and crossfade
+        state remain isolated.
+        """
+        texts = list(texts)
+        if not texts:
+            raise ValueError("texts must contain at least one request")
+        if chunk_tokens <= 0:
+            raise ValueError("chunk_tokens must be positive")
+
+        if audio_prompt_path:
+            self.prepare_conditionals(
+                audio_prompt_path,
+                exaggeration=exaggeration,
+                norm_loudness=norm_loudness,
+            )
+        else:
+            assert self.conds is not None, (
+                "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            )
+
+        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
+            logger.warning(
+                "CFG, min_p and exaggeration are not supported by Turbo version "
+                "and will be ignored.",
+            )
+
+        normalized = [punc_norm(text) for text in texts]
+        tokenized = self.tokenizer(
+            normalized,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+        text_tokens = tokenized.input_ids.to(self.device)
+        text_attention_mask = tokenized.attention_mask.to(self.device)
+
+        streamers = [
+            S3GenStreamer(
+                self.s3gen,
+                self.conds.gen,
+                n_cfm_timesteps=2,
+                crossfade_ms=crossfade_ms,
+            )
+            for _ in texts
+        ]
+        batch_streamer = S3GenBatchStreamer(streamers)
+        chunk_indices = [0] * len(texts)
+        next_samples = [0] * len(texts)
+        completed = [False] * len(texts)
+
+        def make_chunk(
+            request_index: int,
+            wav: torch.Tensor,
+            *,
+            is_final: bool,
+        ) -> StreamingAudioChunk:
+            audio = wav.detach().to(device="cpu", dtype=torch.float32)
+            if audio.ndim == 1:
+                audio = audio.unsqueeze(0)
+            start_sample = next_samples[request_index]
+            end_sample = start_sample + audio.shape[-1]
+            chunk = StreamingAudioChunk(
+                audio=audio,
+                sample_rate=self.sr,
+                index=chunk_indices[request_index],
+                is_final=is_final,
+                start_sample=start_sample,
+                end_sample=end_sample,
+                generated_tokens=streamers[request_index].generated_tokens,
+                watermarked=False,
+            )
+            chunk_indices[request_index] += 1
+            next_samples[request_index] = end_sample
+            return chunk
+
+        with torch.inference_mode():
+            for tokens, valid, finished in self.t3.iter_inference_turbo_batch(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                text_attention_mask=text_attention_mask,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                max_gen_len=max_gen_len,
+            ):
+                flush_indices = []
+                finish_indices = []
+                step_state = (
+                    torch.stack(
+                        [tokens.long(), valid.long(), finished.long()],
+                        dim=1,
+                    )
+                    .cpu()
+                    .tolist()
+                )
+                for request_index, (token_value, is_valid, is_finished) in enumerate(
+                    step_state,
+                ):
+                    if is_valid:
+                        token = tokens[request_index : request_index + 1, None]
+                        if token_value < SPEECH_VOCAB_SIZE:
+                            streamers[request_index].append(token)
+                            if (
+                                streamers[request_index].generated_tokens % chunk_tokens
+                                == 0
+                            ):
+                                flush_indices.append(request_index)
+                    if is_finished and not completed[request_index]:
+                        finish_indices.append(request_index)
+
+                if finish_indices:
+                    finish_set = set(finish_indices)
+                    flush_indices = [
+                        index for index in flush_indices if index not in finish_set
+                    ]
+                    finished_audio = batch_streamer.finish(finish_indices)
+                    for request_index in finish_indices:
+                        completed[request_index] = True
+                    for request_index, wav in finished_audio:
+                        yield (
+                            request_index,
+                            make_chunk(
+                                request_index,
+                                wav,
+                                is_final=True,
+                            ),
+                        )
+
+                for request_index, wav in batch_streamer.flush(flush_indices):
+                    yield (
+                        request_index,
+                        make_chunk(
+                            request_index,
+                            wav,
+                            is_final=False,
+                        ),
+                    )
+
+            unfinished = [
+                index for index, is_complete in enumerate(completed) if not is_complete
+            ]
+            for request_index, wav in batch_streamer.finish(unfinished):
+                completed[request_index] = True
+                yield (
+                    request_index,
+                    make_chunk(
+                        request_index,
+                        wav,
+                        is_final=True,
+                    ),
+                )

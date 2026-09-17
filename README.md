@@ -103,6 +103,25 @@ for chunk in model.stream(
 See `example_tts_turbo_stream.py` for a complete streaming example that can save a WAV
 and play live through PipeWire/PulseAudio/ffplay.
 
+Turbo can also batch independent streaming requests on one GPU. The iterator
+identifies the request associated with each chunk so a server can route it to
+the correct connection:
+
+```python
+texts = [
+    "Your order has shipped and should arrive tomorrow.",
+    "I found the account and can help with that question.",
+]
+
+for request_index, chunk in model.stream_batch(texts, chunk_tokens=24):
+    pcm_bytes = audio_to_pcm_s16le(chunk.audio)
+    # Send pcm_bytes to connections[request_index].
+```
+
+`stream_batch()` is a static microbatch: all complete input texts enter the
+batch together. It streams audio output incrementally, but it does not accept
+incremental text tokens or admit new requests into a running batch.
+
 ##### Chatterbox-Nano
 
 Nano shares Turbo's architecture and is loaded through the same `ChatterboxTurboTTS` class by passing `nano=True`:
