@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Sequence
 
 import torch
@@ -24,19 +24,37 @@ class T3ContinuousRequest:
     text_attention_mask: Tensor
     text_version: int
     input_done: bool
-    history: list[int] = field(default_factory=list)
+    history: Tensor | None = None
+    history_attention_mask: Tensor | None = None
+    waiting_device: Tensor | None = None
+    finished_device: Tensor | None = None
     waiting: bool = False
     finished: bool = False
 
+    @torch.inference_mode()
+    def resume(self) -> None:
+        self.waiting = False
+        if self.history is not None and self.history_attention_mask is not None:
+            self.history = self.history[self.history_attention_mask.bool()]
+            self.history_attention_mask = torch.ones_like(self.history)
+        if self.waiting_device is not None:
+            self.waiting_device.zero_()
+
+    def update_host_state(self, *, waiting: bool, finished: bool) -> None:
+        self.waiting = waiting
+        self.finished = finished
+        if waiting and self.history is not None:
+            self.history = self.history[self.history_attention_mask.bool()]
+            self.history_attention_mask = torch.ones_like(self.history)
+
 
 @dataclass(frozen=True)
-class T3ContinuousToken:
-    request_id: str
-    token: Tensor
-    token_value: int
-    valid: bool
-    waiting: bool
-    finished: bool
+class T3ContinuousStep:
+    request_ids: tuple[str, ...]
+    tokens: Tensor
+    valid: Tensor
+    waiting: Tensor
+    finished: Tensor
 
 
 class T3ContinuousBatchDecoder:
@@ -94,21 +112,35 @@ class T3ContinuousBatchDecoder:
     def step(
         self,
         requests: Sequence[T3ContinuousRequest],
-    ) -> list[T3ContinuousToken]:
+    ) -> T3ContinuousStep | None:
         requests = list(requests)
         if not requests:
             self.reset()
-            return []
+            return None
         request_ids = [request.request_id for request in requests]
         if len(set(request_ids)) != len(request_ids):
             raise ValueError("continuous T3 request ids must be unique")
-        if any(request.waiting or request.finished for request in requests):
-            raise ValueError("continuous T3 step received an inactive request")
-
         start_token = self.t3.hp.start_speech_token
         for request in requests:
-            if not request.history:
-                request.history.append(start_token)
+            if request.history is None:
+                request.history = torch.tensor(
+                    [start_token],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                request.history_attention_mask = torch.ones_like(request.history)
+            if request.waiting_device is None:
+                request.waiting_device = torch.tensor(
+                    request.waiting,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            if request.finished_device is None:
+                request.finished_device = torch.tensor(
+                    request.finished,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
 
         signature = tuple(
             (request.request_id, request.text_version) for request in requests
@@ -128,65 +160,64 @@ class T3ContinuousBatchDecoder:
             hidden = self._outputs[0][:, -1, :]
         speech_logits = self.t3.speech_head(hidden)
 
+        waiting_before = torch.stack(
+            [request.waiting_device for request in requests],
+        )
+        finished_before = torch.stack(
+            [request.finished_device for request in requests],
+        )
+        active = ~waiting_before & ~finished_before
+
         sampled_tokens = []
         for index, request in enumerate(requests):
-            generated_ids = torch.as_tensor(
-                request.history,
-                dtype=torch.long,
-                device=self.device,
-            ).unsqueeze(0)
+            generated_ids = request.history.unsqueeze(0)
             processed_logits = self.logits_processors(
                 generated_ids,
                 speech_logits[index : index + 1],
             )
-            if torch.all(processed_logits == -float("inf")):
-                raise RuntimeError(
-                    f"all Turbo logits are -inf for request {request.request_id}",
-                )
             probabilities = F.softmax(processed_logits, dim=-1)
             sampled_tokens.append(
                 torch.multinomial(probabilities, num_samples=1)[0, 0],
             )
         next_tokens = torch.stack(sampled_tokens)
-        next_token_values = next_tokens.detach().cpu().tolist()
+        next_tokens = torch.where(
+            active,
+            next_tokens,
+            torch.full_like(next_tokens, self.t3.hp.stop_speech_token),
+        )
+        emitted_stop = active & (next_tokens == self.t3.hp.stop_speech_token)
+        valid = active & ~emitted_stop
+        input_done = torch.tensor(
+            [request.input_done for request in requests],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        generated_counts = torch.stack(
+            [
+                request.history_attention_mask.sum() - 1
+                for request in requests
+            ],
+        )
+        reached_limit = valid & (generated_counts + 1 >= self.max_gen_len)
+        waiting = waiting_before | (emitted_stop & ~input_done)
+        finished = finished_before | (emitted_stop & input_done) | reached_limit
 
-        valid_values = []
-        results = []
         for index, request in enumerate(requests):
-            token_value = int(next_token_values[index])
-            valid = token_value != self.t3.hp.stop_speech_token
-            if not valid:
-                if request.input_done:
-                    request.finished = True
-                else:
-                    request.waiting = True
-            else:
-                request.history.append(token_value)
-                if len(request.history) - 1 >= self.max_gen_len:
-                    request.finished = True
-            valid_values.append(valid)
-            results.append(
-                T3ContinuousToken(
-                    request_id=request.request_id,
-                    token=next_tokens[index : index + 1, None],
-                    token_value=token_value,
-                    valid=valid,
-                    waiting=request.waiting,
-                    finished=request.finished,
-                ),
+            request.history = torch.cat(
+                [request.history, next_tokens[index : index + 1]],
             )
+            request.history_attention_mask = torch.cat(
+                [
+                    request.history_attention_mask,
+                    valid[index : index + 1].to(dtype=torch.long),
+                ],
+            )
+            request.waiting_device = waiting[index]
+            request.finished_device = finished[index]
 
         self.step_count += 1
         self.max_batch_size = max(self.max_batch_size, len(requests))
-        if any(request.waiting or request.finished for request in requests):
-            self._invalidate_cache()
-            return results
-
-        continuing = torch.tensor(
-            valid_values,
-            dtype=torch.long,
-            device=self.device,
-        )[:, None]
+        continuing = (valid & ~finished).to(dtype=torch.long)[:, None]
         self._attention_mask = torch.cat(
             [self._attention_mask, continuing],
             dim=1,
@@ -203,7 +234,13 @@ class T3ContinuousBatchDecoder:
         )
         self._past_key_values = self._outputs.past_key_values
         self._rebuilt = False
-        return results
+        return T3ContinuousStep(
+            request_ids=tuple(request_ids),
+            tokens=next_tokens,
+            valid=valid,
+            waiting=waiting,
+            finished=finished,
+        )
 
     def reset(self) -> None:
         self._signature = None
@@ -239,7 +276,7 @@ class T3ContinuousBatchDecoder:
             )
 
         start_token = self.t3.hp.start_speech_token
-        max_speech_length = max(len(request.history) for request in requests)
+        max_speech_length = max(request.history.shape[-1] for request in requests)
         speech_tokens = torch.full(
             (batch_size, max_speech_length),
             start_token,
@@ -247,16 +284,18 @@ class T3ContinuousBatchDecoder:
             device=self.device,
         )
         speech_attention_mask = torch.zeros_like(speech_tokens)
-        speech_lengths = []
         for index, request in enumerate(requests):
-            length = len(request.history)
-            speech_lengths.append(length)
-            speech_tokens[index, :length] = torch.as_tensor(
-                request.history,
-                dtype=torch.long,
+            length = request.history.shape[-1]
+            speech_tokens[index, :length] = request.history.to(
                 device=self.device,
+                dtype=torch.long,
             )
-            speech_attention_mask[index, :length] = 1
+            speech_attention_mask[index, :length] = (
+                request.history_attention_mask.to(
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            )
 
         embeds, len_cond = self.t3.prepare_input_embeds(
             t3_cond=self.t3_cond,
@@ -288,13 +327,17 @@ class T3ContinuousBatchDecoder:
         self._outputs = outputs
         self._past_key_values = outputs.past_key_values
         self._attention_mask = attention_mask
-        self._last_positions = torch.tensor(
-            [
-                len_cond + max_text_length + length - 1
-                for length in speech_lengths
-            ],
+        speech_physical_positions = torch.arange(
+            max_speech_length,
             dtype=torch.long,
             device=self.device,
+        ).expand(batch_size, -1)
+        last_speech_positions = speech_physical_positions.masked_fill(
+            speech_attention_mask == 0,
+            -1,
+        ).amax(dim=1)
+        self._last_positions = (
+            len_cond + max_text_length + last_speech_positions
         )
         self._rebuilt = True
         self.rebuild_count += 1

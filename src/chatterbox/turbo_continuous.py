@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
@@ -42,6 +42,11 @@ class _ContinuousRequestState:
     chunk_index: int = 0
     next_sample: int = 0
     first_speech_token_reported: bool = False
+    next_flush_token: int = 0
+    pending_tokens: list[torch.Tensor] = field(default_factory=list)
+    pending_valid: list[torch.Tensor] = field(default_factory=list)
+    last_waiting: torch.Tensor | None = None
+    last_finished: torch.Tensor | None = None
 
 
 class ChatterboxTurboContinuousEngine:
@@ -118,6 +123,9 @@ class ChatterboxTurboContinuousEngine:
         )
         self.step_count = 0
         self.max_active_requests = 0
+        self._steps_since_host_transfer = 0
+        self.host_transfer_count = 0
+        self.host_transferred_values = 0
 
     @property
     def request_ids(self) -> tuple[str, ...]:
@@ -150,6 +158,7 @@ class ChatterboxTurboContinuousEngine:
                 crossfade_ms=self.crossfade_ms,
                 left_context_tokens=self.decoder_left_context_tokens,
             ),
+            next_flush_token=self.chunk_tokens,
         )
 
     @torch.inference_mode()
@@ -176,26 +185,70 @@ class ChatterboxTurboContinuousEngine:
                 t3_batch_size=0,
             )
 
-        tokens = self._decoder.step(
+        t3_step = self._decoder.step(
             [state.t3_request for state in active_states],
         )
+        if t3_step is None:
+            raise RuntimeError("continuous T3 returned no step for active requests")
         state_by_id = {state.request_id: state for state in active_states}
+        for index, request_id in enumerate(t3_step.request_ids):
+            state = state_by_id[request_id]
+            state.pending_tokens.append(t3_step.tokens[index : index + 1])
+            state.pending_valid.append(t3_step.valid[index : index + 1])
+            state.last_waiting = t3_step.waiting[index]
+            state.last_finished = t3_step.finished[index]
+
+        self._steps_since_host_transfer += 1
+        self.step_count += 1
+        if self._steps_since_host_transfer < self.chunk_tokens:
+            return ContinuousStepResult(
+                audio=(),
+                active_request_ids=active_ids,
+                waiting_request_ids=self._waiting_request_ids(),
+                finished_request_ids=(),
+                cancelled_request_ids=tuple(cancelled),
+                first_speech_token_request_ids=(),
+                t3_batch_size=len(active_states),
+            )
+
+        boundary_states = [
+            state for state in self._requests.values() if state.pending_tokens
+        ]
+        host_rows = self._transfer_boundary_state(boundary_states)
         first_speech_token_ids: list[str] = []
         flush_ids: list[str] = []
         finish_ids: list[str] = []
 
-        for token in tokens:
-            state = state_by_id[token.request_id]
-            if token.valid:
+        for state, row in zip(boundary_states, host_rows):
+            for token, token_value, is_valid in zip(
+                state.pending_tokens,
+                row["tokens"],
+                row["valid"],
+            ):
+                if not is_valid:
+                    continue
                 if not state.first_speech_token_reported:
                     state.first_speech_token_reported = True
-                    first_speech_token_ids.append(token.request_id)
-                if token.token_value < SPEECH_VOCAB_SIZE:
-                    state.streamer.append(token.token)
-                    if state.streamer.generated_tokens % self.chunk_tokens == 0:
-                        flush_ids.append(token.request_id)
-            if token.finished:
-                finish_ids.append(token.request_id)
+                    first_speech_token_ids.append(state.request_id)
+                if token_value < SPEECH_VOCAB_SIZE:
+                    state.streamer.append(token[:, None])
+
+            state.t3_request.update_host_state(
+                waiting=bool(row["waiting"]),
+                finished=bool(row["finished"]),
+            )
+            if state.t3_request.finished:
+                finish_ids.append(state.request_id)
+            elif state.streamer.generated_tokens >= state.next_flush_token:
+                flush_ids.append(state.request_id)
+                while state.next_flush_token <= state.streamer.generated_tokens:
+                    state.next_flush_token += self.chunk_tokens
+            state.pending_tokens.clear()
+            state.pending_valid.clear()
+            state.last_waiting = None
+            state.last_finished = None
+
+        self._steps_since_host_transfer = 0
 
         finish_set = set(finish_ids)
         flush_ids = [request_id for request_id in flush_ids if request_id not in finish_set]
@@ -233,7 +286,6 @@ class ChatterboxTurboContinuousEngine:
         for request_id in finish_ids:
             self._requests.pop(request_id, None)
 
-        self.step_count += 1
         return ContinuousStepResult(
             audio=tuple(audio),
             active_request_ids=active_ids,
@@ -249,6 +301,10 @@ class ChatterboxTurboContinuousEngine:
             "stepCount": self.step_count,
             "requestCount": len(self._requests),
             "maxActiveRequests": self.max_active_requests,
+            "speechTokenSteps": self.step_count,
+            "hostTransferCount": self.host_transfer_count,
+            "hostTransferredValues": self.host_transferred_values,
+            "perSpeechTokenHostTransfers": 0,
             "cudaGraphRequested": self.cuda_graph_requested,
             "cudaGraphEnabled": self.cuda_graph_enabled,
             "cudaGraphFallbackCount": self.cuda_graph_fallback_count,
@@ -284,8 +340,52 @@ class ChatterboxTurboContinuousEngine:
             state.t3_request.text_attention_mask = text_attention_mask
             state.t3_request.text_version = int(snapshot.version)
             state.t3_request.input_done = bool(snapshot.input_done)
-            state.t3_request.waiting = False
+            state.t3_request.resume()
         return cancelled
+
+    def _transfer_boundary_state(
+        self,
+        states: list[_ContinuousRequestState],
+    ) -> list[dict[str, Any]]:
+        """Copy tokens and status once at a PCM-sized scheduling boundary."""
+        if not states:
+            return []
+        token_lengths = [len(state.pending_tokens) for state in states]
+        tokens = torch.cat(
+            [torch.cat(state.pending_tokens) for state in states],
+        ).to(dtype=torch.long)
+        valid = torch.cat(
+            [torch.cat(state.pending_valid) for state in states],
+        ).to(dtype=torch.long)
+        waiting = torch.stack([state.last_waiting for state in states]).to(
+            dtype=torch.long,
+        )
+        finished = torch.stack([state.last_finished for state in states]).to(
+            dtype=torch.long,
+        )
+        payload = torch.cat([tokens, valid, waiting, finished])
+        host = payload.detach().cpu().tolist()
+        token_total = sum(token_lengths)
+        token_values = host[:token_total]
+        valid_values = host[token_total : 2 * token_total]
+        waiting_values = host[2 * token_total : 2 * token_total + len(states)]
+        finished_values = host[2 * token_total + len(states) :]
+
+        rows = []
+        offset = 0
+        for index, length in enumerate(token_lengths):
+            rows.append(
+                {
+                    "tokens": token_values[offset : offset + length],
+                    "valid": valid_values[offset : offset + length],
+                    "waiting": waiting_values[index],
+                    "finished": finished_values[index],
+                },
+            )
+            offset += length
+        self.host_transfer_count += 1
+        self.host_transferred_values += len(host)
+        return rows
 
     def _tokenize(self, snapshot: Any) -> tuple[torch.Tensor, torch.Tensor]:
         normalized = self.normalize_text(

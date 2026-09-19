@@ -91,8 +91,14 @@ class T3ContinuousBatchDecoderTests(unittest.TestCase):
         decoder.step([first])
         decoder.step([first, late])
 
-        self.assertEqual(first.history, [0, 2, 2])
-        self.assertEqual(late.history, [0, 2])
+        self.assertEqual(
+            first.history[first.history_attention_mask.bool()].tolist(),
+            [0, 2, 2],
+        )
+        self.assertEqual(
+            late.history[late.history_attention_mask.bool()].tolist(),
+            [0, 2],
+        )
         self.assertEqual(decoder.metrics()["membershipChangeCount"], 1)
         self.assertEqual(decoder.metrics()["maxBatchSize"], 2)
 
@@ -109,16 +115,16 @@ class T3ContinuousBatchDecoderTests(unittest.TestCase):
         request = _request("live", input_done=False)
         t3.next_token = t3.hp.stop_speech_token
 
-        first_result = decoder.step([request])[0]
-        self.assertTrue(first_result.waiting)
-        self.assertFalse(first_result.finished)
+        first_result = decoder.step([request])
+        self.assertTrue(first_result.waiting.item())
+        self.assertFalse(first_result.finished.item())
 
-        request.waiting = False
+        request.resume()
         request.input_done = True
         request.text_version += 1
-        second_result = decoder.step([request])[0]
-        self.assertTrue(second_result.finished)
-        self.assertFalse(second_result.valid)
+        second_result = decoder.step([request])
+        self.assertTrue(second_result.finished.item())
+        self.assertFalse(second_result.valid.item())
         self.assertGreaterEqual(decoder.metrics()["rebuildCount"], 2)
 
 
