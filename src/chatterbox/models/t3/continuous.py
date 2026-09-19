@@ -98,11 +98,15 @@ class T3ContinuousBatchDecoder:
         self._past_key_values = None
         self._attention_mask: Tensor | None = None
         self._last_positions: Tensor | None = None
+        self._sampling_history: Tensor | None = None
+        self._sampling_history_attention_mask: Tensor | None = None
         self._rebuilt = False
         self.step_count = 0
         self.rebuild_count = 0
         self.membership_change_count = 0
         self.max_batch_size = 0
+        self.sampling_batch_call_count = 0
+        self.sampled_row_count = 0
 
     @property
     def device(self):
@@ -168,22 +172,9 @@ class T3ContinuousBatchDecoder:
         )
         active = ~waiting_before & ~finished_before
 
-        sampled_tokens = []
-        for index, request in enumerate(requests):
-            generated_ids = request.history.unsqueeze(0)
-            processed_logits = self.logits_processors(
-                generated_ids,
-                speech_logits[index : index + 1],
-            )
-            probabilities = F.softmax(processed_logits, dim=-1)
-            sampled_tokens.append(
-                torch.multinomial(probabilities, num_samples=1)[0, 0],
-            )
-        next_tokens = torch.stack(sampled_tokens)
-        next_tokens = torch.where(
-            active,
-            next_tokens,
-            torch.full_like(next_tokens, self.t3.hp.stop_speech_token),
+        next_tokens = self._sample_batch(
+            speech_logits,
+            active=active,
         )
         emitted_stop = active & (next_tokens == self.t3.hp.stop_speech_token)
         valid = active & ~emitted_stop
@@ -193,25 +184,28 @@ class T3ContinuousBatchDecoder:
             device=self.device,
         )
         generated_counts = torch.stack(
-            [
-                request.history_attention_mask.sum() - 1
-                for request in requests
-            ],
+            [request.history_attention_mask.sum() - 1 for request in requests],
         )
         reached_limit = valid & (generated_counts + 1 >= self.max_gen_len)
         waiting = waiting_before | (emitted_stop & ~input_done)
         finished = finished_before | (emitted_stop & input_done) | reached_limit
 
+        self._sampling_history = torch.cat(
+            [self._sampling_history, next_tokens[:, None]],
+            dim=1,
+        )
+        self._sampling_history_attention_mask = torch.cat(
+            [
+                self._sampling_history_attention_mask,
+                valid.to(dtype=torch.long)[:, None],
+            ],
+            dim=1,
+        )
         for index, request in enumerate(requests):
-            request.history = torch.cat(
-                [request.history, next_tokens[index : index + 1]],
-            )
-            request.history_attention_mask = torch.cat(
-                [
-                    request.history_attention_mask,
-                    valid[index : index + 1].to(dtype=torch.long),
-                ],
-            )
+            request.history = self._sampling_history[index]
+            request.history_attention_mask = self._sampling_history_attention_mask[
+                index
+            ]
             request.waiting_device = waiting[index]
             request.finished_device = finished[index]
 
@@ -252,7 +246,43 @@ class T3ContinuousBatchDecoder:
             "rebuildCount": self.rebuild_count,
             "membershipChangeCount": self.membership_change_count,
             "maxBatchSize": self.max_batch_size,
+            "samplingBatchCalls": self.sampling_batch_call_count,
+            "sampledRows": self.sampled_row_count,
+            "samplingPythonRowIterations": 0,
         }
+
+    def _processed_sampling_logits(self, speech_logits: Tensor) -> Tensor:
+        """Apply the sampling policy once to the complete GPU batch.
+
+        Invalid history positions are replaced with the row's first valid
+        token. Repetition penalty depends on the set of token ids that has
+        appeared, so repeating an already-valid id preserves the unpadded
+        per-request policy without introducing a padding token.
+        """
+        if (
+            self._sampling_history is None
+            or self._sampling_history_attention_mask is None
+        ):
+            raise RuntimeError("continuous T3 sampling history is not initialized")
+        first_valid_token = self._sampling_history[:, :1]
+        sampling_ids = torch.where(
+            self._sampling_history_attention_mask.bool(),
+            self._sampling_history,
+            first_valid_token,
+        )
+        return self.logits_processors(sampling_ids, speech_logits)
+
+    def _sample_batch(self, speech_logits: Tensor, *, active: Tensor) -> Tensor:
+        processed_logits = self._processed_sampling_logits(speech_logits)
+        probabilities = F.softmax(processed_logits, dim=-1)
+        sampled = torch.multinomial(probabilities, num_samples=1).squeeze(1)
+        self.sampling_batch_call_count += 1
+        self.sampled_row_count += int(speech_logits.shape[0])
+        return torch.where(
+            active,
+            sampled,
+            torch.full_like(sampled, self.t3.hp.stop_speech_token),
+        )
 
     def _rebuild(self, requests: Sequence[T3ContinuousRequest]) -> None:
         batch_size = len(requests)
@@ -290,11 +320,9 @@ class T3ContinuousBatchDecoder:
                 device=self.device,
                 dtype=torch.long,
             )
-            speech_attention_mask[index, :length] = (
-                request.history_attention_mask.to(
-                    device=self.device,
-                    dtype=torch.long,
-                )
+            speech_attention_mask[index, :length] = request.history_attention_mask.to(
+                device=self.device,
+                dtype=torch.long,
             )
 
         embeds, len_cond = self.t3.prepare_input_embeds(
@@ -327,6 +355,8 @@ class T3ContinuousBatchDecoder:
         self._outputs = outputs
         self._past_key_values = outputs.past_key_values
         self._attention_mask = attention_mask
+        self._sampling_history = speech_tokens
+        self._sampling_history_attention_mask = speech_attention_mask
         speech_physical_positions = torch.arange(
             max_speech_length,
             dtype=torch.long,
@@ -336,9 +366,7 @@ class T3ContinuousBatchDecoder:
             speech_attention_mask == 0,
             -1,
         ).amax(dim=1)
-        self._last_positions = (
-            len_cond + max_text_length + last_speech_positions
-        )
+        self._last_positions = len_cond + max_text_length + last_speech_positions
         self._rebuilt = True
         self.rebuild_count += 1
 
@@ -347,4 +375,6 @@ class T3ContinuousBatchDecoder:
         self._past_key_values = None
         self._attention_mask = None
         self._last_positions = None
+        self._sampling_history = None
+        self._sampling_history_attention_mask = None
         self._rebuilt = False

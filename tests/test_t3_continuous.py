@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 from chatterbox.models.t3.continuous import (
     T3ContinuousBatchDecoder,
@@ -75,6 +77,99 @@ def _request(request_id: str, *, version: int = 1, input_done: bool = True):
 
 
 class T3ContinuousBatchDecoderTests(unittest.TestCase):
+    def test_vectorized_sampling_matches_per_request_policy(self) -> None:
+        t3 = _FakeT3()
+        decoder = T3ContinuousBatchDecoder(
+            t3,
+            object(),
+            pad_token_id=0,
+            temperature=0.7,
+            top_k=6,
+            top_p=0.8,
+            repetition_penalty=1.2,
+        )
+        decoder._sampling_history = torch.tensor(
+            [
+                [0, 1, 2, 0],
+                [0, 3, 0, 0],
+                [0, 1, 4, 5],
+            ],
+        )
+        decoder._sampling_history_attention_mask = torch.tensor(
+            [
+                [1, 1, 1, 0],
+                [1, 1, 0, 0],
+                [1, 1, 1, 1],
+            ],
+        )
+        logits = torch.tensor(
+            [
+                [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+                [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
+                [0.2, 0.8, 0.3, 0.7, 0.4, 0.6, 0.5, 0.9, 0.1, 1.0],
+            ],
+        )
+
+        reference_rows = []
+        for index in range(logits.shape[0]):
+            history = decoder._sampling_history[index][
+                decoder._sampling_history_attention_mask[index].bool()
+            ].unsqueeze(0)
+            reference_rows.append(
+                decoder.logits_processors(
+                    history,
+                    logits[index : index + 1],
+                ),
+            )
+        reference = torch.cat(reference_rows)
+
+        vectorized = decoder._processed_sampling_logits(logits)
+
+        self.assertTrue(
+            torch.equal(torch.isfinite(vectorized), torch.isfinite(reference))
+        )
+        self.assertTrue(
+            torch.allclose(
+                torch.nan_to_num(vectorized),
+                torch.nan_to_num(reference),
+            ),
+        )
+        self.assertTrue(
+            torch.allclose(
+                F.softmax(vectorized, dim=-1),
+                F.softmax(reference, dim=-1),
+            ),
+        )
+
+    def test_sampling_uses_one_multinomial_call_for_the_batch(self) -> None:
+        t3 = _FakeT3()
+        decoder = T3ContinuousBatchDecoder(
+            t3,
+            object(),
+            pad_token_id=0,
+            top_k=1,
+            top_p=1.0,
+            repetition_penalty=1.0,
+        )
+        batch_size = 8
+        decoder._sampling_history = torch.zeros(batch_size, 3, dtype=torch.long)
+        decoder._sampling_history_attention_mask = torch.ones(
+            batch_size,
+            3,
+            dtype=torch.long,
+        )
+        logits = torch.arange(10, dtype=torch.float32).repeat(batch_size, 1)
+        active = torch.tensor([True, True, False, True, True, False, True, True])
+
+        with patch("torch.multinomial", wraps=torch.multinomial) as multinomial:
+            sampled = decoder._sample_batch(logits, active=active)
+
+        self.assertEqual(multinomial.call_count, 1)
+        self.assertEqual(sampled.tolist(), [9, 9, 9, 9, 9, 9, 9, 9])
+        self.assertEqual(decoder.metrics()["samplingBatchCalls"], 1)
+        self.assertEqual(decoder.metrics()["sampledRows"], batch_size)
+        self.assertEqual(decoder.metrics()["samplingPythonRowIterations"], 0)
+
     def test_late_request_joins_without_restarting_existing_history(self) -> None:
         t3 = _FakeT3()
         decoder = T3ContinuousBatchDecoder(
