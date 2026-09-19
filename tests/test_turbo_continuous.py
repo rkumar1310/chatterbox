@@ -91,7 +91,7 @@ class _Streamer:
 
 
 class _BatchStreamer:
-    def __init__(self, streamers) -> None:
+    def __init__(self, streamers, **_kwargs) -> None:
         self.streamers = list(streamers)
 
     def flush(self, indices, **_kwargs):

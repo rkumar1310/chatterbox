@@ -460,7 +460,12 @@ class HiFTGenerator(nn.Module):
         return generated_speech, f0
 
     @torch.inference_mode()
-    def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+    def inference(
+        self,
+        speech_feat: torch.Tensor,
+        cache_source: torch.Tensor = torch.zeros(1, 1, 0),
+        cache_source_lens: torch.Tensor = None,
+    ) -> torch.Tensor:
         # mel->f0
         f0 = self.f0_predictor(speech_feat)
         # f0->source
@@ -469,6 +474,20 @@ class HiFTGenerator(nn.Module):
         s = s.transpose(1, 2)
         # use cache_source to avoid glitch
         if cache_source.shape[2] != 0:
-            s[:, :, :cache_source.shape[2]] = cache_source
+            cache_size = min(cache_source.shape[2], s.shape[2])
+            if cache_source_lens is None:
+                s[:, :, :cache_size] = cache_source[:, :, :cache_size]
+            else:
+                cache_source_lens = cache_source_lens.to(
+                    device=s.device,
+                    dtype=torch.long,
+                )
+                positions = torch.arange(cache_size, device=s.device)
+                cache_mask = positions[None, :] < cache_source_lens[:, None]
+                s[:, :, :cache_size] = torch.where(
+                    cache_mask[:, None, :],
+                    cache_source[:, :, :cache_size],
+                    s[:, :, :cache_size],
+                )
         generated_speech = self.decode(x=speech_feat, s=s)
         return generated_speech, s

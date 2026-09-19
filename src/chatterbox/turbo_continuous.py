@@ -6,7 +6,11 @@ from typing import Any, Callable
 
 import torch
 
-from .models.s3gen import S3GenBatchStreamer, S3GenStreamer
+from .models.s3gen import (
+    S3GenBatchingMetrics,
+    S3GenBatchStreamer,
+    S3GenStreamer,
+)
 from .models.s3tokenizer import SPEECH_VOCAB_SIZE
 from .models.t3 import T3ContinuousBatchDecoder, T3ContinuousRequest
 from .streaming import StreamingAudioChunk
@@ -72,6 +76,7 @@ class ChatterboxTurboContinuousEngine:
         max_gen_len: int = 1000,
         crossfade_ms: float = 12.0,
         decoder_left_context_tokens: int = 25,
+        s3gen_bucket_width_tokens: int = 8,
         min_update_chars: int = 16,
         max_update_latency_seconds: float = 0.12,
         temperature: float = 0.8,
@@ -103,6 +108,12 @@ class ChatterboxTurboContinuousEngine:
         self.chunk_tokens = int(chunk_tokens)
         self.crossfade_ms = float(crossfade_ms)
         self.decoder_left_context_tokens = int(decoder_left_context_tokens)
+        self.s3gen_bucket_width_tokens = int(s3gen_bucket_width_tokens)
+        if self.s3gen_bucket_width_tokens < 1:
+            raise ValueError("S3Gen bucket width must be positive")
+        self._s3gen_batching_metrics = S3GenBatchingMetrics(
+            self.s3gen_bucket_width_tokens,
+        )
         self.min_update_chars = int(min_update_chars)
         self.max_update_latency_seconds = float(max_update_latency_seconds)
         self.cuda_graph_requested = bool(use_cuda_graph)
@@ -257,6 +268,8 @@ class ChatterboxTurboContinuousEngine:
         decode_index = {request_id: index for index, request_id in enumerate(decode_ids)}
         batch_streamer = S3GenBatchStreamer(
             [state.streamer for state in decode_states],
+            bucket_width_tokens=self.s3gen_bucket_width_tokens,
+            metrics=self._s3gen_batching_metrics,
         )
 
         audio: list[ContinuousAudioOutput] = []
@@ -309,6 +322,7 @@ class ChatterboxTurboContinuousEngine:
             "cudaGraphEnabled": self.cuda_graph_enabled,
             "cudaGraphFallbackCount": self.cuda_graph_fallback_count,
             "t3": self._decoder.metrics(),
+            "s3gen": self._s3gen_batching_metrics.as_dict(),
         }
 
     def _refresh_requests(self) -> list[str]:

@@ -322,10 +322,19 @@ class S3Token2Wav(S3Token2Mel):
         return output_mels
 
     @torch.inference_mode()
-    def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
+    def hift_inference(
+        self,
+        speech_feat,
+        cache_source: torch.Tensor = None,
+        cache_source_lens: torch.Tensor = None,
+    ):
         if cache_source is None:
             cache_source = torch.zeros(1, 1, 0).to(device=self.device, dtype=self.dtype)
-        return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
+        return self.mel2wav.inference(
+            speech_feat=speech_feat,
+            cache_source=cache_source,
+            cache_source_lens=cache_source_lens,
+        )
 
     @torch.inference_mode()
     def inference(
