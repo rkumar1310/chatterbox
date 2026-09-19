@@ -12,10 +12,11 @@ from chatterbox.models.s3gen.streamer import (
 
 
 class _FakeS3Gen:
-    def __init__(self) -> None:
+    def __init__(self, *, vary_waveform_by_call: bool = False) -> None:
         self.device = torch.device("cpu")
         self.dtype = torch.float32
         self.meanflow = True
+        self.vary_waveform_by_call = vary_waveform_by_call
         self.flow = SimpleNamespace(
             pre_lookahead_len=3,
             token_mel_ratio=2,
@@ -70,6 +71,8 @@ class _FakeS3Gen:
             speech_feat.shape[0] + 1,
             dtype=self.dtype,
         )[:, None]
+        if self.vary_waveform_by_call:
+            rows = rows + len(self.hift_calls) - 1
         wavs = rows.expand(-1, samples).clone()
         return wavs, wavs[:, None, :].clone()
 
@@ -132,6 +135,33 @@ class S3GenStreamerWindowTest(unittest.TestCase):
 
 
 class S3GenBatchStreamerBucketTest(unittest.TestCase):
+    def test_bucketed_chunks_crossfade_without_emitting_padding(self):
+        s3gen = _FakeS3Gen(vary_waveform_by_call=True)
+        streamer = S3GenStreamer(
+            s3gen,
+            {},
+            crossfade_ms=20,
+            left_context_tokens=25,
+        )
+        batch = S3GenBatchStreamer([streamer], bucket_width_tokens=8)
+
+        streamer.append(torch.arange(12))
+        first = batch.flush([0])[0][1]
+        streamer.append(torch.arange(12))
+        second = batch.flush([0])[0][1]
+        final = batch.finish([0])[0][1]
+        combined = torch.cat([first, second, final], dim=1)
+
+        self.assertEqual(first.shape[-1], 8_160)
+        self.assertEqual(second.shape[-1], 11_520)
+        self.assertEqual(final.shape[-1], 6_240)
+        self.assertEqual(combined.shape[-1], 25_920)
+        self.assertEqual(second[0, 0].item(), 1.0)
+        self.assertEqual(second[0, 479].item(), 2.0)
+        self.assertEqual(final[0, 0].item(), 2.0)
+        self.assertEqual(final[0, 479].item(), 3.0)
+        self.assertLess(torch.diff(combined).abs().max().item(), 0.01)
+
     def test_incremental_mixed_lengths_share_bucket_and_crop_padding(self):
         s3gen = _FakeS3Gen()
         ref_dict = {}
