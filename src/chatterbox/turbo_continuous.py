@@ -13,7 +13,7 @@ from .models.s3gen import (
 )
 from .models.s3tokenizer import SPEECH_VOCAB_SIZE
 from .models.t3 import T3ContinuousBatchDecoder, T3ContinuousRequest
-from .streaming import StreamingAudioChunk
+from .streaming import AsyncPCMTransferManager, StreamingAudioChunk
 
 
 @dataclass(frozen=True)
@@ -137,6 +137,7 @@ class ChatterboxTurboContinuousEngine:
         self._steps_since_host_transfer = 0
         self.host_transfer_count = 0
         self.host_transferred_values = 0
+        self._pcm_transfer_manager = AsyncPCMTransferManager()
 
     @property
     def request_ids(self) -> tuple[str, ...]:
@@ -174,6 +175,7 @@ class ChatterboxTurboContinuousEngine:
 
     @torch.inference_mode()
     def step(self) -> ContinuousStepResult:
+        self._pcm_transfer_manager.mark_inference_step()
         cancelled = self._refresh_requests()
         active_states = [
             state
@@ -266,10 +268,14 @@ class ChatterboxTurboContinuousEngine:
         self._steps_since_host_transfer = 0
 
         finish_set = set(finish_ids)
-        flush_ids = [request_id for request_id in flush_ids if request_id not in finish_set]
+        flush_ids = [
+            request_id for request_id in flush_ids if request_id not in finish_set
+        ]
         decode_ids = [state.request_id for state in self._requests.values()]
         decode_states = [self._requests[request_id] for request_id in decode_ids]
-        decode_index = {request_id: index for index, request_id in enumerate(decode_ids)}
+        decode_index = {
+            request_id: index for index, request_id in enumerate(decode_ids)
+        }
         batch_streamer = S3GenBatchStreamer(
             [state.streamer for state in decode_states],
             bucket_width_tokens=self.s3gen_bucket_width_tokens,
@@ -327,7 +333,12 @@ class ChatterboxTurboContinuousEngine:
             "cudaGraphFallbackCount": self.cuda_graph_fallback_count,
             "t3": self._decoder.metrics(),
             "s3gen": self._s3gen_batching_metrics.as_dict(),
+            "pcmTransfer": self._pcm_transfer_manager.metrics(),
         }
+
+    def pcm_transfer_metrics(self) -> dict[str, int | float]:
+        """Return live transfer metrics without reading mutable decoder state."""
+        return self._pcm_transfer_manager.metrics()
 
     def _refresh_requests(self) -> list[str]:
         now = time.monotonic()
@@ -431,15 +442,11 @@ class ChatterboxTurboContinuousEngine:
         *,
         is_final: bool,
     ) -> StreamingAudioChunk:
-        # Task 6 replaces this synchronous transfer with GPU-side PCM16 and a
-        # pinned-memory copy stream. Keep the existing behavior for Task 1.
-        audio = wav.detach().to(device="cpu", dtype=torch.float32)
-        if audio.ndim == 1:
-            audio = audio.unsqueeze(0)
+        pcm_transfer = self._pcm_transfer_manager.enqueue(wav)
         start_sample = state.next_sample
-        end_sample = start_sample + audio.shape[-1]
+        end_sample = start_sample + pcm_transfer.sample_count
         chunk = StreamingAudioChunk(
-            audio=audio,
+            audio=None,
             sample_rate=self.sample_rate,
             index=state.chunk_index,
             is_final=is_final,
@@ -447,6 +454,7 @@ class ChatterboxTurboContinuousEngine:
             end_sample=end_sample,
             generated_tokens=state.streamer.generated_tokens,
             watermarked=False,
+            pcm_transfer=pcm_transfer,
         )
         state.chunk_index += 1
         state.next_sample = end_sample
