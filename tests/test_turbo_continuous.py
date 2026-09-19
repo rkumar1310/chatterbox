@@ -19,8 +19,8 @@ class _Snapshot:
 
 
 class _Source:
-    def __init__(self, text: str) -> None:
-        self.value = _Snapshot(text)
+    def __init__(self, text: str, *, input_done: bool = True) -> None:
+        self.value = _Snapshot(text, input_done=input_done)
 
     def snapshot(self):
         return self.value
@@ -31,6 +31,13 @@ class _Source:
             version=self.value.version + 1,
             input_done=self.value.input_done,
             cancelled=True,
+        )
+
+    def update(self, text: str, *, input_done: bool) -> None:
+        self.value = _Snapshot(
+            text,
+            version=self.value.version + 1,
+            input_done=input_done,
         )
 
 
@@ -54,9 +61,11 @@ class _Decoder:
     def __init__(self, *_args, **_kwargs) -> None:
         self.counts = {}
         self.max_batch = 0
+        self.empty_steps = 0
 
     def step(self, requests):
         if not requests:
+            self.empty_steps += 1
             return None
         self.max_batch = max(self.max_batch, len(requests))
         tokens = []
@@ -82,6 +91,25 @@ class _Decoder:
         return {"maxBatchSize": self.max_batch}
 
 
+class _WaitingDecoder(_Decoder):
+    def step(self, requests):
+        if not requests:
+            self.empty_steps += 1
+            return None
+        self.max_batch = max(self.max_batch, len(requests))
+        request = requests[0]
+        count = self.counts.get(request.request_id, 0) + 1
+        self.counts[request.request_id] = count
+        waiting = count == 1
+        return SimpleNamespace(
+            request_ids=(request.request_id,),
+            tokens=torch.tensor([9 if waiting else 2]),
+            valid=torch.tensor([not waiting]),
+            waiting=torch.tensor([waiting]),
+            finished=torch.tensor([False]),
+        )
+
+
 class _Streamer:
     def __init__(self, *_args, **_kwargs) -> None:
         self.generated_tokens = 0
@@ -102,6 +130,37 @@ class _BatchStreamer:
 
 
 class TurboContinuousEngineTests(unittest.TestCase):
+    def test_waiting_request_keeps_decoder_cache_until_text_resumes(self) -> None:
+        with patch.multiple(
+            continuous,
+            T3ContinuousBatchDecoder=_WaitingDecoder,
+            S3GenStreamer=_Streamer,
+            S3GenBatchStreamer=_BatchStreamer,
+        ):
+            source = _Source("hello", input_done=False)
+            engine = continuous.ChatterboxTurboContinuousEngine(
+                t3=_T3(),
+                s3gen=SimpleNamespace(),
+                tokenizer=_Tokenizer(),
+                t3_conditionals=object(),
+                s3gen_conditionals={},
+                sample_rate=24_000,
+                normalize_text=lambda text, **_kwargs: text,
+                chunk_tokens=1,
+            )
+            engine.add_request("live", source)
+
+            first = engine.step()
+            self.assertEqual(first.waiting_request_ids, ("live",))
+            engine.step()
+            self.assertEqual(engine._decoder.empty_steps, 0)
+
+            source.update("hello again", input_done=True)
+            resumed = engine.step()
+
+            self.assertEqual(resumed.active_request_ids, ("live",))
+            self.assertEqual(engine._decoder.counts["live"], 2)
+
     def test_host_state_is_transferred_only_at_pcm_boundaries(self) -> None:
         with patch.multiple(
             continuous,

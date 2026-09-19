@@ -184,7 +184,11 @@ class ChatterboxTurboContinuousEngine:
         self.max_active_requests = max(self.max_active_requests, len(active_states))
 
         if not active_states:
-            self._decoder.step([])
+            # Preserve the last batch cache while requests are waiting for more
+            # live text. A same-membership resume can then crop to the cached
+            # text prefix and replay speech instead of starting from scratch.
+            if not self._requests:
+                self._decoder.step([])
             self.step_count += 1
             return ContinuousStepResult(
                 audio=(),
