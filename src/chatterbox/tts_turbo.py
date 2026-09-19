@@ -631,6 +631,49 @@ class ChatterboxTurboTTS:
                     ),
                 )
 
+    def create_continuous_engine(
+        self,
+        *,
+        chunk_tokens=24,
+        max_gen_len=1000,
+        crossfade_ms=12.0,
+        decoder_left_context_tokens=25,
+        min_update_chars=16,
+        max_update_latency_seconds=0.12,
+        temperature=0.8,
+        top_k=1000,
+        top_p=0.95,
+        repetition_penalty=1.2,
+        use_cuda_graph=True,
+    ):
+        """Create a request-keyed engine with changeable batch membership."""
+        if self.conds is None:
+            raise RuntimeError(
+                "Please `prepare_conditionals` before creating a continuous engine",
+            )
+        from .turbo_continuous import ChatterboxTurboContinuousEngine
+
+        return ChatterboxTurboContinuousEngine(
+            t3=self.t3,
+            s3gen=self.s3gen,
+            tokenizer=self.tokenizer,
+            t3_conditionals=self.conds.t3,
+            s3gen_conditionals=self.conds.gen,
+            sample_rate=self.sr,
+            normalize_text=punc_norm,
+            chunk_tokens=chunk_tokens,
+            max_gen_len=max_gen_len,
+            crossfade_ms=crossfade_ms,
+            decoder_left_context_tokens=decoder_left_context_tokens,
+            min_update_chars=min_update_chars,
+            max_update_latency_seconds=max_update_latency_seconds,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            use_cuda_graph=use_cuda_graph,
+        )
+
     def stream_live_batch(
         self,
         text_sources: Sequence,
