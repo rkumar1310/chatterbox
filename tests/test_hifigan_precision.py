@@ -1,7 +1,9 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from chatterbox.models.s3gen.hifigan import SineGen, SourceModuleHnNSF
+from chatterbox.models.s3gen.hifigan import HiFTGenerator, SineGen, SourceModuleHnNSF
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
@@ -30,3 +32,18 @@ def test_source_module_accepts_matching_low_precision_weights(dtype):
     assert merged.dtype == dtype
     assert noise.dtype == dtype
     assert voiced.dtype == dtype
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_istft_uses_float32_fallback_and_restores_output_dtype(dtype):
+    generator = SimpleNamespace(
+        istft_params={"n_fft": 16, "hop_len": 4},
+        stft_window=torch.hann_window(16),
+    )
+    magnitude = torch.ones((1, 9, 8), dtype=dtype)
+    phase = torch.zeros_like(magnitude)
+
+    waveform = HiFTGenerator._istft(generator, magnitude, phase)
+
+    assert waveform.dtype == dtype
+    assert torch.isfinite(waveform).all()
