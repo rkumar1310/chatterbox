@@ -194,7 +194,7 @@ class SineGen(torch.nn.Module):
 
     def _f02uv(self, f0):
         # generate uv signal
-        uv = (f0 > self.voiced_threshold).type(torch.float32)
+        uv = (f0 > self.voiced_threshold).to(dtype=f0.dtype)
         return uv
 
     @torch.no_grad()
@@ -204,13 +204,17 @@ class SineGen(torch.nn.Module):
         :return: [B, 1, sample_len]
         """
 
-        F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(f0.device)
+        F_mat = f0.new_zeros(
+            (f0.size(0), self.harmonic_num + 1, f0.size(-1)),
+        )
         for i in range(self.harmonic_num + 1):
             F_mat[:, i: i + 1, :] = f0 * (i + 1) / self.sampling_rate
 
         theta_mat = 2 * np.pi * (torch.cumsum(F_mat, dim=-1) % 1)
         u_dist = Uniform(low=-np.pi, high=np.pi)
-        phase_vec = u_dist.sample(sample_shape=(f0.size(0), self.harmonic_num + 1, 1)).to(F_mat.device)
+        phase_vec = u_dist.sample(
+            sample_shape=(f0.size(0), self.harmonic_num + 1, 1),
+        ).to(device=F_mat.device, dtype=F_mat.dtype)
         phase_vec[:, 0, :] = 0
 
         # generate sine waveforms
