@@ -1,0 +1,9 @@
+{
+  "case": "09-long-story",
+  "device": "mps",
+  "status": "stopped_before_completion",
+  "reason": "Generation slowed sharply as the utterance grew; complete long-audio validation moved to CPU.",
+  "audio_seconds_emitted": 15.44,
+  "last_chunk_elapsed_seconds": 559.3637272499036,
+  "emitted_chunks": 78
+}

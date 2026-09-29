@@ -1,0 +1,26 @@
+[
+  {
+    "id": "01-simple-weather",
+    "group": "simple",
+    "text": "The weather is pleasant today.",
+    "seed": 17,
+    "device": "cpu",
+    "audio_seconds": 1.8,
+    "audio_chunks": 9,
+    "first_audio_seconds": 1.1511592499446124,
+    "total_seconds": 10.162861834047362,
+    "input_tokens": 6,
+    "max_conditioning_history_tokens": 25,
+    "max_decoder_input_tokens": 33,
+    "audio_before_eos": true,
+    "sample_rate": 24000,
+    "dtype": "torch.float32",
+    "peak_observed_mps_driver_bytes": null,
+    "streamed_wav_sha256": "a1a29976577f24186223cc4049edc62578acc20bb9bb80489e430b45d4ea2dd4",
+    "native_wav_sha256": "6a80b5c5fee40fd0874f07628660827c744bb73fb111880f18ad04adb5baa474",
+    "rms": 0.03218294332463691,
+    "clipped_sample_fraction": 0.0,
+    "automatic_checks": "passed",
+    "listening_review": "pending"
+  }
+]

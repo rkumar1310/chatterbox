@@ -87,11 +87,11 @@ def export_examples(rows, output, destination):
             '<p>Listen for pipe sounds, metallic tones, clicks, missing words, repeated words and changes in voice around chunk boundaries; automatic checks do not certify audio quality.</p>']
     md = ['# Nano streaming listening examples', '',
           'New recordings generated on the device shown below, with unchanged Nano weights, five-token chunks, 25-token history and no added vocoder delay.', '',
-          '| Case | Text | Duration | Streamed audio | Native audio |',
-          '| --- | --- | ---: | --- | --- |']
+          '| Case | Device | Text | Duration | Streamed audio | Native audio |',
+          '| --- | --- | --- | ---: | --- | --- |']
     for row in rows:
         stem = row['id']
-        md.append(f"| {stem} | {row['text']} | {row['audio_seconds']:.2f} s | [Streamed](audio/{stem}-streamed.wav) | [Native](audio/{stem}-native.wav) |")
+        md.append(f"| {stem} | {row['device'].upper()} | {row['text']} | {row['audio_seconds']:.2f} s | [Streamed](audio/{stem}-streamed.wav) | [Native](audio/{stem}-native.wav) |")
         page += [f"<section><h2>{html.escape(stem)}</h2><p>{html.escape(row['text'])}</p>",
                  f"<p>{row['device'].upper()} · {row['audio_seconds']:.2f} s · {row['audio_chunks']} chunks · listening review pending</p><div class=pair>",
                  f'<div><p>Streamed</p><audio controls preload="none" src="audio/{stem}-streamed.wav"></audio></div>',
@@ -103,14 +103,14 @@ def export_examples(rows, output, destination):
            'Listening review remains pending; these checks do not measure phonetic accuracy, intelligibility or freedom from acoustic artifacts.', '',
            'Timings follow a per-case warm-up and exclude loading, preprocessing and speaker preparation; first audio means the first nonempty waveform chunk returned to the consumer.', '',
            'See `results.json` for device, FP32 dtype, seed, input length, chunk count, timing and sampled Metal driver memory; CPU uses two threads and batch size one.', '',
-           'Run `python scripts/validate_nano_streaming.py --device mps --output artifacts/new-validation --export-listening examples/nano_streaming` to regenerate all nine cases sequentially.', '',
+           'Run `python scripts/validate_nano_streaming.py --device cpu --output artifacts/new-validation --export-listening examples/nano_streaming` to regenerate all nine cases sequentially on CPU; use `--device mps` to test Metal explicitly.', '',
            'Use `--only 01-simple-weather` for one case or `--resume` to reuse completed recordings whose inputs, settings, hashes and source still match.']
     (destination / "README.md").write_text('\n'.join(md) + '\n')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--device', choices=('cpu', 'mps', 'cuda'), default='mps')
+    parser.add_argument('--device', choices=('cpu', 'mps', 'cuda'), default='cpu')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--assets', type=Path)
     parser.add_argument('--cases', type=Path, default=ROOT / 'examples/nano_streaming/cases.json')

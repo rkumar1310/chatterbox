@@ -12,7 +12,7 @@ uv pip install --python .venv/bin/python -r streaming-requirements.lock
 uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e .
 ```
 
-Other repositories can install this clone with `pip install /absolute/path/to/chatterbox-nano-streaming`, or install a wheel built here, then import the same public API.
+Other repositories can install this GitHub branch directly with `pip install 'git+https://github.com/rkumar1310/chatterbox.git@nano-streaming'`, then import the same public API.
 
 ```python
 from chatterbox.nano_streaming import StreamConfig, load_nano
@@ -58,9 +58,11 @@ The GitHub branch is `rkumar1310/chatterbox:nano-streaming`; clone this branch a
 The five new simple sentences, two one-word responses, medium paragraph and long story are defined in `examples/nano_streaming/cases.json`; run them sequentially with:
 
 ```sh
-.venv/bin/python scripts/validate_nano_streaming.py --device mps --output artifacts/new-validation --export-listening examples/nano_streaming
+.venv/bin/python scripts/validate_nano_streaming.py --device cpu --output artifacts/new-validation --export-listening examples/nano_streaming
 ```
 
 Each case has a fixed seed and generation cap, and produces streamed chunks, joined audio, a matched native recording and an automatic verification report; model processes run one at a time.
+
+Use `--device mps` for Metal checks; our five sentences, two one-word responses and 12-second paragraph completed on MPS, while the full 32-second story completed on CPU after the MPS attempt became impractically slow.
 
 The committed `examples/nano_streaming/audio` directory contains the paired final WAVs, and `examples/nano_streaming/listen.html` provides audio players for local listening; recordings still require human review for artifacts and intelligibility.
