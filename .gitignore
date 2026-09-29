@@ -46,3 +46,8 @@ checkpoints/
 
 # Ignore generated sample .wav files
 **/*.wav
+
+# Recorded validation examples belong in this fork.
+!examples/nano_streaming/audio/*.wav
+.venv/
+artifacts/

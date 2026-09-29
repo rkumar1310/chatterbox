@@ -3,6 +3,8 @@
 
 # Chatterbox TTS
 
+This fork's `nano-streaming` branch adds Chatterbox Nano audio streaming with generated acoustic history conditioning; see [STREAMING.md](STREAMING.md) for setup and [the listening examples](examples/nano_streaming/README.md) for streamed and native recordings.
+
 [![Alt Text](https://img.shields.io/badge/listen-demo_samples-blue)](https://resemble-ai.github.io/chatterbox_demopage/)
 [![Alt Text](https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-sm.svg)](https://huggingface.co/spaces/ResembleAI/Chatterbox-Multilingual-TTS)
 [![Alt Text](https://static-public.podonos.com/badges/insight-on-pdns-sm-dark.svg)](https://podonos.com/resembleai/chatterbox)

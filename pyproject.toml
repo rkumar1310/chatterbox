@@ -41,3 +41,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"chatterbox.nano_streaming" = ["upstream-source.json", "NOTICE.md", "README.md"]

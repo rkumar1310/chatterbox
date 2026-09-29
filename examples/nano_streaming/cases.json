@@ -1,0 +1,11 @@
+[
+  {"id":"01-simple-weather","group":"simple","text":"The weather is pleasant today.","seed":17,"max_gen_len":256},
+  {"id":"02-simple-door","group":"simple","text":"Please close the door gently.","seed":23,"max_gen_len":256},
+  {"id":"03-simple-meeting","group":"simple","text":"Your meeting starts at nine.","seed":31,"max_gen_len":256},
+  {"id":"04-simple-keys","group":"simple","text":"I left the keys on the table.","seed":43,"max_gen_len":256},
+  {"id":"05-simple-tea","group":"simple","text":"Would you like a cup of tea?","seed":59,"max_gen_len":256},
+  {"id":"06-tiny-yes","group":"tiny","text":"Yes.","seed":17,"max_gen_len":128},
+  {"id":"07-tiny-no","group":"tiny","text":"No.","seed":23,"max_gen_len":128},
+  {"id":"08-medium-directions","group":"medium","text":"When you leave the station, turn left and walk past the small bakery. Cross the road at the traffic lights, then follow the path beside the river. The library is the red brick building at the end of the path, just before the wooden bridge.","seed":31,"max_gen_len":768},
+  {"id":"09-long-story","group":"long","text":"On Saturday morning, Maya packed a small bag and set out for the coast. The train moved slowly through green fields, quiet villages, and a forest full of tall trees. When she arrived, the sky was clear and a gentle wind carried the sound of waves across the platform. She walked to the harbour, bought a warm loaf of bread, and sat beside an old fishing boat. A friendly dog wandered over and rested at her feet. After lunch, she followed a narrow path up the hill and stopped to look at the sea. Far below, children were building a castle in the sand while their parents watched from the shore. Maya took a photograph, put away her phone, and stayed until the evening light turned the water gold. It had been a simple day, but she knew she would remember it for a long time.","seed":43,"max_gen_len":1536}
+]
