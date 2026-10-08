@@ -53,3 +53,5 @@ checkpoints/
 artifacts/
 .gitignore
 branch_structure.json
+config.bat
+node_modules
