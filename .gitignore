@@ -24,7 +24,6 @@ parts/
 sdist/
 var/
 wheels/
-temp_auto_push.bat
 *.egg-info/
 .installed.cfg
 *.egg
@@ -52,4 +51,3 @@ checkpoints/
 .venv/
 artifacts/
 .gitignore
-branch_structure.json
